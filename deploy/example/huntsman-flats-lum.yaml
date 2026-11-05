@@ -1,0 +1,56 @@
+# Example: planned twilight flats, Lum filter, every Huntsman camera.
+#
+# This is the `burr:` section of a SensorKit deployment config, for SensorKit
+# mode only (`sensorkit go -c <config>`). It is an EXAMPLE: nothing loads this
+# file, and it does not change any live configuration. To use it, merge the
+# `twilight_flats` block into the `burr:` section of your SensorKit config,
+# after the supervised pilot in docs/flats.md ("Pilot checklist").
+#
+# Requires a sensorkit with per-instrument CameraParameterSet support
+# (`instrument`/`request_id`) and the planned-flats burr module.
+#
+# camera     = the UNITID the camera's data graph writes into each frame
+# instrument = the SensorKit camera device key that takes that pair
+# filter     = the filter name EXACTLY as that camera's wheel reports it.
+#              Wheel names are case-sensitive; "Lum" will not match "L" or
+#              "lum". Confirm each wheel's names before the pilot.
+burr:
+  - id: Burr
+    controller: Huntsman
+    # Where the camera data graphs write burr frames (their write_file
+    # directory, without the {controller_name}/<camera> suffix).
+    raw_data_root: /opt/huntsman/data/raw/burr
+    plotting:
+      debug: false
+      review: false
+    runtime:
+      output_dir: /opt/huntsman/data/processed/burr/
+    schedule:
+      twilight_flats:
+        collect: true
+        windows: [nautical_twilight]
+        minimum_exposure_seconds: 0.1
+        maximum_exposure_seconds: 30
+        min_counts: 30000
+        max_counts: 50000
+        max_saturation_percentage: 1.0
+        frame_settle_seconds: 60
+        scheduling:
+          type: one_shot
+        plan:
+          frames_per_pair: 10
+          pairs:
+            - {camera: C0,  instrument: C0-ASI183MM,  filter: Lum}
+            - {camera: C1,  instrument: C1-ASI183MM,  filter: Lum}
+            - {camera: C2,  instrument: C2-ASI183MM,  filter: Lum}
+            - {camera: C3,  instrument: C3-ASI183MM,  filter: Lum}
+            - {camera: C4,  instrument: C4-ASI183MM,  filter: Lum}
+            - {camera: C5,  instrument: C5-ASI183MM,  filter: Lum}
+            - {camera: C6,  instrument: C6-ASI183MM,  filter: Lum}
+            - {camera: C7,  instrument: C7-ASI183MM,  filter: Lum}
+            - {camera: C10, instrument: C10-ASI183MM, filter: Lum}
+      # Other sources are off in this example so a pilot exercises flats alone.
+      lunar_background: {collect: false}
+      calsats: {collect: false}
+      photometric_standards: {collect: false}
+      coverage: {collect: false}

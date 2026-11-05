@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from burr.models.site import SiteMetadata
 from burr.models.hardware import HardwareConfig
+from burr.task_source.flats.plan import FlatPlanConfig
 
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,13 @@ class TwilightFlatsConfig(BaseModel):
     )
     frame_settle_seconds: float = Field(
         default=30.0, description="SK mode: how long to wait for camera FITS writes to land after a collect"
+    )
+    plan: FlatPlanConfig | None = Field(
+        default=None,
+        description=(
+            "SK mode: explicit camera/filter pairs to collect, each pinned to its instrument with its own "
+            "exposure. Without a plan, one shared exposure goes to whichever camera SensorKit chooses"
+        ),
     )
     scheduling: OneTimeSchedulingConfig = Field(
         default_factory=OneTimeSchedulingConfig, description="Scheduling configuration"

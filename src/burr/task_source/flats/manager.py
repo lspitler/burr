@@ -16,10 +16,17 @@ from the FITS ``UNITID`` and ``FILTER`` headers. Each pair counts, numbers
 and restores independently; see ``products.py`` for naming, publication and
 restart, and ``docs/flats.md`` for the recovery rules.
 
-Limitations: each request still uses ONE exposure (the median of the pairs'
-ideal exposures), and current sensorkit gives a single-``CameraParameterSet``
-request to one camera. Pairs therefore only accumulate as cameras happen to
-be chosen, and completion covers only pairs seen so far.
+Planned collection (``twilight_flats.plan``, SensorKit only): every
+planned camera/filter pair is tracked from the start and gets its own
+exposure in each request, pinned to its instrument and filter. Frames are
+matched to the request by the SensorKit task ID (``SKTASKID``) and to the
+pair by ``UNITID``/``FILTER``; anything else is reported and never counted.
+Collection is complete only when every planned pair reaches its target.
+
+Without a plan, each request uses ONE exposure (the median of the pairs'
+ideal exposures) and SensorKit chooses a single camera for it, so pairs only
+accumulate as cameras happen to be chosen and completion covers only pairs
+seen so far.
 
 Implements the TaskSource protocol defined in burr.task_source.protocol.
 """
@@ -27,6 +34,7 @@ Implements the TaskSource protocol defined in burr.task_source.protocol.
 from __future__ import annotations
 
 import time
+import uuid as uuidlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -47,6 +55,7 @@ from burr.models.observation import (
 from burr.models.run import BurrRun
 from burr.models.site import LightingCondition
 from burr.models.tracking import TrackingMode
+from burr.task_source.flats.plan import FlatPairPlan, FlatPlanConfig
 from burr.task_source.flats.products import (
     DEFAULT_CAMERA,
     SEQUENCE_CARD,
@@ -194,6 +203,26 @@ def _is_flat_frame(path: Path) -> bool:
         return False
 
 
+def _image_header_cards(path: Path) -> fits.Header | None:
+    """Header of the first image HDU in ``path``, without reading pixels; None if unreadable.
+
+    Matches ``load_image_hdu``'s choice of HDU (SK's compressed image, not
+    the empty primary) using header shape only.
+    """
+    try:
+        with fits.open(path) as hdul:
+            for hdu in hdul:
+                if (
+                    isinstance(hdu, fits.CompImageHDU)
+                    or hdu.header.get("NAXIS", 0) >= 2
+                ):
+                    return hdu.header.copy()
+            return None
+    except (OSError, ValueError, fits.VerifyError) as e:
+        logger.debug(f"Skipping unreadable FITS {path}: {e}")
+        return None
+
+
 def _central_cutout(data: np.ndarray, size: int | None) -> np.ndarray:
     """Central ``size``x``size`` box of ``data`` (whole frame if None/too big)."""
     if size is None:
@@ -247,6 +276,16 @@ class FlatFieldManager:
         self.max_saturation_percentage = self.config.max_saturation_percentage
         self.saturation_threshold = self.config.saturation_threshold
         self.sk_data_root = Path(sk_data_root) if sk_data_root else None
+        self.plan: FlatPlanConfig | None = self.config.plan
+        if self.plan is not None and self.sk_data_root is None:
+            raise ValueError(
+                "twilight_flats.plan needs SensorKit mode (a raw_data_root to read frames from)"
+            )
+        self._planned: dict[FlatSequenceKey, FlatPairPlan] = (
+            self.plan.by_key() if self.plan else {}
+        )
+        # SensorKit task ID and per-pair request IDs of each dispatched request.
+        self._dispatched: dict[str, str] = {}
 
         # Track the last in-flight request's start time so on_request_completed
         # only picks up frames written for this request.
@@ -261,6 +300,13 @@ class FlatFieldManager:
         self._accepted_sources: set[str] = set()
         self._accepted_digests: set[str] = set()
         self._restore_sequences()
+        for key in self._planned:
+            self.cameras.setdefault(key, FlatSequenceState())
+        for key in sorted(set(self.cameras) - set(self._planned)) if self.plan else ():
+            logger.warning(
+                f"Accepted flats exist for {key.label()}, which is not in the flat plan; "
+                f"left in place and not counted toward completion"
+            )
         self.current_exposure = self.minimum_exposure  # Start with minimum exposure
 
         logger.info(f"Initialized FlatFieldManager (target: {self.target_flats} flats per camera/filter)")
@@ -271,6 +317,10 @@ class FlatFieldManager:
         logger.info(f"├── Max saturation: {self.max_saturation_percentage}%")
         logger.info(f"├── Saturation threshold: {self.saturation_threshold or 'auto-detect'}")
         logger.info(f"└── Resuming from {self.good_frames} existing good frames ({len(self.cameras)} sequence(s))")
+        if self.plan is not None:
+            logger.info(
+                f"Flat plan: {len(self._planned)} pair(s): {self.progress_summary()}"
+            )
 
     # ------------------------------------------------------------------
     # TaskSource protocol properties
@@ -295,10 +345,39 @@ class FlatFieldManager:
 
     @property
     def good_frames(self) -> int:
-        """Good frames of the camera/filter sequence furthest behind (done when it is)."""
-        if not self.cameras:
+        """Good frames of the sequence furthest behind (done when it is).
+
+        With a plan, only planned pairs count.
+        """
+        states = (
+            [self.cameras[key] for key in self._planned]
+            if self.plan
+            else list(self.cameras.values())
+        )
+        if not states:
             return 0
-        return min(state.good_frames for state in self.cameras.values())
+        return min(state.good_frames for state in states)
+
+    def target_for(self, key: FlatSequenceKey) -> int:
+        """Accepted frames required for ``key``: its plan entry's, else ``n_frames``."""
+        pair = self._planned.get(key)
+        return self.plan.target(pair) if pair is not None else self.target_flats
+
+    def remaining_pairs(self) -> list[FlatSequenceKey]:
+        """Planned pairs still short of their target, in plan order."""
+        return [
+            key
+            for key in self._planned
+            if self.cameras[key].good_frames < self.target_for(key)
+        ]
+
+    def progress_summary(self) -> str:
+        """``C0/Lum=3/10, C1/Lum=0/10`` for planned pairs, or seen sequences without a plan."""
+        keys = list(self._planned) if self.plan else sorted(self.cameras)
+        return ", ".join(
+            f"{key.label()}={self.cameras[key].good_frames}/{self.target_for(key)}"
+            for key in keys
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -361,8 +440,8 @@ class FlatFieldManager:
         now for sky change) over camera/filter sequences not yet complete.
         """
         candidates = []
-        for state in self.cameras.values():
-            if state.good_frames >= self.target_flats or not state.exposures:
+        for key, state in self.cameras.items():
+            if state.good_frames >= self.target_for(key) or not state.exposures:
                 continue
             last = state.exposures[-1]
             candidates.append(self._next_exposure_for(last.exposure_time, last.median_counts, last.timestamp))
@@ -448,6 +527,8 @@ class FlatFieldManager:
             raise
         except ValueError as e:
             raise FlatRejected(str(e)) from e
+        if self.plan is not None and key not in self._planned:
+            raise FlatRejected(f"{key.label()} is not in the flat plan; not counted")
         uuid = _header_text(header, "SKTASKID") or _header_text(header, "TASKID")
         if not uuid:
             raise FlatRejected("SensorKit flat has no SKTASKID or TASKID")
@@ -494,9 +575,8 @@ class FlatFieldManager:
         saturation_good = stats.saturation_percentage <= self.max_saturation_percentage
         # A sequence that is already complete still updates its exposure
         # model, but its extra frames are not kept.
-        is_good = (
-            counts_good and saturation_good and state.good_frames < self.target_flats
-        )
+        target = self.target_for(key)
+        is_good = counts_good and saturation_good and state.good_frames < target
 
         self.cameras[key] = state
         state.exposures.append(
@@ -515,7 +595,7 @@ class FlatFieldManager:
             return self._save_good_frame(
                 frame, state, stats, exposure_time, timestamp, device_control
             )
-        if state.good_frames >= self.target_flats:
+        if state.good_frames >= target:
             logger.info(
                 f"[{key.label()}] already has {state.good_frames} flats — frame not kept"
             )
@@ -573,7 +653,7 @@ class FlatFieldManager:
             self._accepted_digests.add(frame.digest)
 
         logger.success(
-            f"Good flat frame [{key.label()}] ({state.good_frames}/{self.target_flats}):"
+            f"Good flat frame [{key.label()}] ({state.good_frames}/{self.target_for(key)}):"
         )
         logger.info(f"├── Clipped mean counts: {stats.average_counts:,.0f}")
         logger.info(f"├── Saturation: {stats.saturation_percentage:.2f}%")
@@ -582,7 +662,7 @@ class FlatFieldManager:
 
         self.run.log_command(
             "flat_field_saved",
-            f"{state.good_frames}/{self.target_flats} flats collected",
+            f"{state.good_frames}/{self.target_for(key)} flats collected",
             {
                 "camera": key.camera,
                 "filter": key.filter,
@@ -740,6 +820,9 @@ class FlatFieldManager:
             )
             return None
 
+        if self.plan is not None:
+            return self._planned_request(task_id)
+
         # Re-project every camera's ideal exposure to now (the sky has moved
         # on since the last frames were analysed) and share one exposure.
         self.current_exposure = self._shared_exposure()
@@ -767,12 +850,69 @@ class FlatFieldManager:
 
         return request
 
-    def is_collection_complete(self) -> bool:
-        """Check if every camera/filter sequence seen so far has enough good flats.
+    def _pair_exposure(self, key: FlatSequenceKey) -> float:
+        """This pair's ideal exposure now: its last frame re-projected, else the minimum."""
+        state = self.cameras[key]
+        if not state.exposures:
+            return self.minimum_exposure
+        last = state.exposures[-1]
+        return self._next_exposure_for(
+            last.exposure_time, last.median_counts, last.timestamp
+        )
 
-        Only sequences that have produced a frame are known, so this cannot
-        tell whether every expected camera/filter pair has been collected.
+    def _planned_request(self, task_id: str) -> ObservationRequest:
+        """One request with its own pinned exposure for every incomplete planned pair.
+
+        ``metadata["flat_plan"]`` lists, per pair, the camera, the SensorKit
+        instrument to pin, the filter, its exposure and a ``request_id``. The
+        SensorKit burr program turns each entry into its own
+        ``CameraParameterSet``. ``exposure_seconds`` holds the shortest, only
+        to keep the request well formed.
         """
+        entries = [
+            {
+                "camera": key.camera,
+                "instrument": self._planned[key].instrument,
+                "filter": key.filter,
+                "exposure_seconds": self._pair_exposure(key),
+                "request_id": str(uuidlib.uuid4()),
+            }
+            for key in self.remaining_pairs()
+        ]
+        self._request_started_at = datetime.now(ZoneInfo("UTC"))
+        self.current_exposure = min(entry["exposure_seconds"] for entry in entries)
+        request = ObservationRequest(
+            task_id=task_id,
+            source_name="twilight_flats",
+            target=AltAzTarget(altitude_deg=75.0, azimuth_deg=0.0),
+            exposure_seconds=[self.current_exposure],
+            exposure_map=[ExposureSpec(tracking_mode=TrackingMode.OFF)],
+            rates=None,
+            metadata={"flat_plan": entries},
+        )
+        logger.info(
+            f"Generated planned flat request {task_id} for {len(entries)} pair(s):"
+        )
+        for entry in entries:
+            key = FlatSequenceKey(entry["camera"], entry["filter"])
+            logger.info(
+                f"├── {key.label()} on {entry['instrument']}: {entry['exposure_seconds']:.3f}s "
+                f"({self.cameras[key].good_frames}/{self.target_for(key)})"
+            )
+        logger.info("└── Pointing: Alt=75.0, Az=0.0, tracking OFF")
+        return request
+
+    def is_collection_complete(self) -> bool:
+        """Check whether collection is done.
+
+        With a plan: every planned pair has reached its target, including
+        pairs that have not yet returned any frame. Without one: every
+        sequence seen so far has ``n_frames``; only sequences that produced a
+        frame are known, so this cannot tell whether every camera/filter was
+        collected.
+        """
+        if self.plan is not None:
+            return not self.remaining_pairs()
         return bool(self.cameras) and self.good_frames >= self.target_flats
 
     def on_request_completed(
@@ -804,6 +944,9 @@ class FlatFieldManager:
 
         if self.sk_data_root is None:
             return
+        if self.plan is not None:
+            self._complete_planned(request)
+            return
 
         frame_paths = self._wait_for_sk_flats(request)
         if not frame_paths:
@@ -825,6 +968,89 @@ class FlatFieldManager:
                 for key, state in sorted(self.cameras.items())
             )
         )
+
+    def on_task_dispatched(self, request: ObservationRequest, sk_task_id: str) -> None:
+        """Record the SensorKit task ID minted for ``request``.
+
+        The SensorKit burr program calls this once the controller accepts the
+        task. Planned frames are matched to the request by this ID, which the
+        camera data graph writes into every frame as ``SKTASKID``.
+        """
+        self._dispatched[request.task_id] = str(sk_task_id)
+        logger.debug(
+            f"Flat request {request.task_id} dispatched as SensorKit task {sk_task_id}"
+        )
+
+    def _complete_planned(self, request: ObservationRequest) -> None:
+        """Match a planned request's frames exactly, then measure each pair's frame."""
+        sk_task_id = self._dispatched.pop(request.task_id, None)
+        expected = {
+            FlatSequenceKey(e["camera"], e["filter"]): e
+            for e in request.metadata.get("flat_plan", [])
+        }
+        if sk_task_id is None:
+            logger.error(
+                f"Flat request {request.task_id} has no recorded SensorKit task ID; its frames cannot be "
+                f"matched exactly and are not counted ({', '.join(k.label() for k in expected)})"
+            )
+            return
+        matched, unexpected = self._wait_for_task_frames(sk_task_id, expected)
+        for path, reason in unexpected:
+            logger.warning(
+                f"Frame {path} from task {sk_task_id} is not counted: {reason}"
+            )
+        for key in expected:
+            path = matched.get(key)
+            if path is None:
+                logger.warning(
+                    f"[{key.label()}] returned no frame for request {request.task_id} (task {sk_task_id})"
+                )
+                continue
+            self.process_exposure(str(path), device_control=None)
+        logger.info(f"Flats per planned pair: {self.progress_summary()}")
+
+    def _wait_for_task_frames(
+        self, sk_task_id: str, expected: dict[FlatSequenceKey, dict]
+    ) -> tuple[dict[FlatSequenceKey, Path], list[tuple[Path, str]]]:
+        """Wait for one frame per expected pair carrying ``sk_task_id``.
+
+        Returns the frame matched to each pair, and frames from this task that
+        match no expected pair (an unplanned camera or filter, or a second
+        frame for one pair). Polls until every pair has a frame or
+        ``frame_settle_seconds`` elapses.
+        """
+        deadline = time.monotonic() + self.frame_settle_seconds
+        while True:
+            matched, unexpected = self._task_frames(sk_task_id, expected)
+            if len(matched) == len(expected) or time.monotonic() >= deadline:
+                return matched, unexpected
+            time.sleep(0.5)
+
+    def _task_frames(
+        self, sk_task_id: str, expected: dict[FlatSequenceKey, dict]
+    ) -> tuple[dict[FlatSequenceKey, Path], list[tuple[Path, str]]]:
+        """Frames under ``sk_data_root`` whose ``SKTASKID`` is ``sk_task_id``, sorted to pairs."""
+        matched: dict[FlatSequenceKey, Path] = {}
+        unexpected: list[tuple[Path, str]] = []
+        output_root = Path(self.run.output_directory).resolve()
+        for path in sorted(self.sk_data_root.rglob("*.fits")):
+            if path.resolve().is_relative_to(output_root):
+                continue
+            header = _image_header_cards(path)
+            if header is None or _header_text(header, "SKTASKID") != sk_task_id:
+                continue
+            key = FlatSequenceKey(
+                _header_text(header, "UNITID"), _header_text(header, "FILTER")
+            )
+            if key not in expected:
+                unexpected.append(
+                    (path, f"{key.label()} was not requested by this task")
+                )
+            elif key in matched:
+                unexpected.append((path, f"second frame for {key.label()}"))
+            else:
+                matched[key] = path
+        return matched, unexpected
 
     def _wait_for_sk_flats(self, request: ObservationRequest) -> list[Path]:
         """Wait for the cameras' flat frames for ``request`` to land, then return them.
@@ -888,6 +1114,18 @@ class FlatFieldManager:
         error : str
             Description of the failure.
         """
+        self._dispatched.pop(request.task_id, None)
+        planned = request.metadata.get("flat_plan") or []
+        if planned:
+            pairs = ", ".join(
+                f"{e['camera']}/{e['filter']} on {e['instrument']}" for e in planned
+            )
+            logger.error(
+                f"Planned flat request {request.task_id} failed; none of its pairs were collected "
+                f"({pairs}). SensorKit reported: {error}"
+            )
+            logger.info(f"Flats per planned pair: {self.progress_summary()}")
+            return
         logger.warning(
             f"Flat request {request.task_id} failed: {error} "
             f"({self.good_frames}/{self.target_flats} good frames so far)"

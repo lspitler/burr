@@ -15,6 +15,102 @@ accepted count, exposure history, ideal next exposure and filename numbering.
 `n_frames` is the target for **each** pair. Collection is complete when every
 pair seen so far has `n_frames` accepted products (see Limitations).
 
+## Planned collection (SensorKit)
+
+`twilight_flats.plan` lists every camera/filter pair that needs flats, the
+SensorKit instrument that takes it, and how many accepted frames it needs:
+
+```yaml
+twilight_flats:
+  windows: [nautical_twilight]
+  plan:
+    frames_per_pair: 10            # target for each pair unless overridden
+    pairs:
+      - {camera: C0, instrument: C0-ASI183MM, filter: Lum}
+      - {camera: C1, instrument: C1-ASI183MM, filter: Lum, frames: 5}
+```
+
+`deploy/example/huntsman-flats-lum.yaml` is a complete example covering all
+nine Huntsman cameras with Lum. It is an example only; nothing loads it.
+
+| Field        | Meaning                                                                 |
+| ------------ | ----------------------------------------------------------------------- |
+| `camera`     | the `UNITID` the camera's data graph writes into each frame             |
+| `instrument` | the SensorKit camera device key that takes this pair                    |
+| `filter`     | the filter name **exactly** as that camera's wheel reports it (case-sensitive) |
+| `frames`     | accepted frames this pair needs; defaults to `frames_per_pair`          |
+
+### Validation
+
+The plan is rejected at config load if:
+
+- it has no pairs;
+- a camera/filter pair is listed twice, including twice with only a
+  difference in case (`C0/Lum` and `c0/lum`);
+- a camera or filter name is unsafe as a path component (the rules under
+  Identity safety), or has leading or trailing whitespace;
+- an instrument is not a single device-key token;
+- one camera maps to two instruments, or one instrument to two cameras;
+- `frames` or `frames_per_pair` is below 1;
+- an entry has an unknown key (typos are errors, not ignored).
+
+A plan needs SensorKit mode. A manager given a plan without a
+`raw_data_root` refuses to start.
+
+### Requests and routing
+
+Every planned pair is tracked from the start, at `0/N`, including pairs
+whose camera never returns an image.
+
+Each request carries one exposure for every pair still short of its
+target:
+
+- that pair's own ideal exposure: its last frame re-projected to now, or
+  the minimum for a pair with no frames yet;
+- its filter;
+- its instrument.
+
+The SensorKit burr program turns these into one `StandardCollectTask` with
+one `CameraParameterSet` per pair. Each set sets `instrument`, which
+SensorKit's planner honours by assigning the exposure **only** to that
+camera, and `filter_name`, which goes to that camera's wheel. The cameras
+expose together.
+
+If a pinned camera cannot take its filter (its wheel reports a filter list
+without it), SensorKit fails the whole collect rather than moving the
+exposure to another camera. burr then logs the request as failed, naming
+every pair in it and SensorKit's reason. Nothing is counted.
+
+A global `collect.filter_name` does not override a pair's filter. Global
+gain, binning and readout mode still apply.
+
+### Matching frames to requests
+
+When SensorKit accepts the task, burr records the task ID the controller
+mints for it; cameras write that ID into every frame as `SKTASKID`. After
+the collect, burr reads back only frames whose `SKTASKID` is exactly that
+ID, and assigns each to the planned pair named by its `UNITID` and
+`FILTER`. Modification time and file name play no part.
+
+| Frame                                                   | Result                            |
+| ------------------------------------------------------- | --------------------------------- |
+| this task, a requested pair, first frame for it         | measured, kept if good            |
+| this task, a camera or filter not requested             | reported, not counted             |
+| this task, a second frame for one pair                  | reported, not counted             |
+| another task                                            | ignored                           |
+| a requested pair with no frame within `frame_settle_seconds` | that pair is reported as returning no frame |
+
+If no task ID was recorded for a request, its frames cannot be matched
+exactly, and none are counted.
+
+### Completion and unexpected identities
+
+Collection is complete only when **every planned pair** has reached its
+target. A frame for a camera or filter outside the plan is never accepted,
+never creates state, and never counts. Accepted products found on disk for
+pairs outside the plan (from an earlier, different plan) are reported at
+start-up, left in place, and not counted.
+
 ## Accepted SensorKit products
 
 ```
@@ -170,27 +266,57 @@ Direct (ASCOM) mode keeps its existing behaviour:
 - Direct mode has no source-file duplicate check: the executor reuses one
   temporary path per exposure, and its frames carry no task UUID.
 
+## Pilot checklist
+
+Planned collection is tested end to end against SensorKit's real planner
+with synthetic frames, but not yet on the telescope. Before relying on it,
+run a supervised pilot at twilight:
+
+1. **Filter names.** Confirm each wheel reports a filter named exactly as in
+   the plan (e.g. `Lum`, not `L` or `lum`). A mismatch fails the whole
+   collect at planning time, which the log reports.
+2. **SensorKit build.** Run a SensorKit that has `CameraParameterSet.instrument`
+   and the planned-flats burr module, with this burr. A mismatched pair does
+   not misroute silently:
+   - **SensorKit core without `instrument`** would silently drop the field
+     and let the planner place every exposure anywhere. The burr module
+     checks for it and refuses to build a planned task, so the request
+     fails with "cannot pin an exposure to an instrument".
+   - **An older SensorKit burr module** ignores the plan and never reports
+     the task ID. Every planned request then logs "has no recorded SensorKit
+     task ID ... not counted" at error level, and nothing is counted.
+3. **Task ID in headers.** Check one frame from the pilot: `SKTASKID` must
+   equal the task ID in burr's "dispatched as SensorKit task" log line.
+4. **Concurrent exposures.** Confirm all planned cameras exposed in one
+   collect, each with the exposure burr logged for it.
+5. **Settle time.** Confirm every camera's frame lands within
+   `frame_settle_seconds`. A slow camera is reported as returning no frame;
+   raise the setting if so.
+6. **Counts.** Confirm the per-pair counts, and that the exposure each pair
+   converges to keeps its median in the count window.
+7. **Pointing and vignetting.** Flats still point at a fixed Alt 75°, Az 0°.
+   Check for slit vignetting on the outer cameras.
+
 ## Limitations
 
 These are known and left for later milestones:
 
-- **One exposure per request.** Each request uses a single exposure: the
-  median of the pairs' ideal exposures. Pairs whose filter or optics need a
-  very different exposure are rejected more often.
-- **One camera per request in SensorKit.** Current SensorKit gives a request
-  with one `CameraParameterSet` to a single camera, so pairs accumulate only
-  as cameras happen to be chosen. All-camera collection is **not** solved
-  here.
-- **Completion covers only pairs seen so far.** There is no configured
-  expected camera/filter matrix, so collection can report complete while
-  pairs that never produced a frame have none.
-- **No requested filters.** burr does not choose filters; it records the
-  filter each camera reports.
-- **Source-file duplicate protection only.** Frames are not yet matched to
-  the exact SensorKit task that produced them; discovery still selects
-  candidates by modification time and `IMAGETYP`.
+- **Without a plan**, behaviour is unchanged: each request uses one shared
+  exposure, SensorKit chooses a single camera for it, and completion covers
+  only pairs seen so far. Planned collection (above) resolves all three.
+- **One filter per pair per request.** A plan with several filters on one
+  camera collects them in separate requests, one pair per camera at a time,
+  so a camera's filters are not interleaved within a twilight.
+- **No preflight filter check.** burr does not read the wheels' filter lists
+  before requesting; an unavailable filter is discovered when SensorKit
+  plans the collect, which fails the whole request.
+- **Unchanged pointing.** Flats point at a fixed Alt 75°, Az 0°.
+- **Direct mode** is unchanged and has no plan support.
+- **Plan-less SensorKit discovery** still selects candidate frames by
+  modification time and `IMAGETYP`; only planned collection matches by
+  task ID.
 
-Recommended next milestone: explicit requested filters and a configured
-expected camera/filter matrix. Then emit one `CameraParameterSet` per pair
-with its own exposure, and associate each frame with its SensorKit task ID.
-That closes the shared-exposure, completion and discovery gaps together.
+Recommended next milestone: a preflight that checks each planned wheel's
+reported filters, so an unavailable pair is skipped and reported before the
+request is sent instead of failing it; then per-camera filter sequencing
+within one twilight.
