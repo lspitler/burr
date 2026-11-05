@@ -151,6 +151,8 @@ example_20251201/
 
 Runs auto-resume if interrupted. Starting again on the same night picks up where it left off.
 
+Accepted twilight flats are organised by camera and filter under `data/flats/<camera>/<filter>/`. See [docs/flats.md](docs/flats.md) for the naming, safe publication, restart and legacy-history rules.
+
 ## Citation
 
 Burr implements the system described in:

@@ -11,20 +11,21 @@ the sky brightening/darkening by ``2 ** (elapsed / sky_doubling_seconds)``
 since that frame was taken. Counts are a sigma-clipped mean over a central
 cutout, which keeps vignetted corners out of the statistic.
 
-Multi-camera: one request fans out to every camera on the controller (SK
-mode). Each camera keeps its own exposure state, keyed by the FITS ``UNITID``
-header (falling back to the frame's parent directory), and the next request
-uses an exposure that serves the cameras still short of ``n_frames``. A
-camera whose ideal exposure is far from the shared one is simply rejected
-that cycle and recovers as the sky changes; per-camera exposure times need
-sensorkit support for per-instrument collect parameters.
+Sequences: state is kept per camera/filter pair (``FlatSequenceKey``),
+from the FITS ``UNITID`` and ``FILTER`` headers. Each pair counts, numbers
+and restores independently; see ``products.py`` for naming, publication and
+restart, and ``docs/flats.md`` for the recovery rules.
+
+Limitations: each request still uses ONE exposure (the median of the pairs'
+ideal exposures), and current sensorkit gives a single-``CameraParameterSet``
+request to one camera. Pairs therefore only accumulate as cameras happen to
+be chosen, and completion covers only pairs seen so far.
 
 Implements the TaskSource protocol defined in burr.task_source.protocol.
 """
 
 from __future__ import annotations
 
-import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -46,10 +47,32 @@ from burr.models.observation import (
 from burr.models.run import BurrRun
 from burr.models.site import LightingCondition
 from burr.models.tracking import TrackingMode
+from burr.task_source.flats.products import (
+    DEFAULT_CAMERA,
+    SEQUENCE_CARD,
+    SOURCE_HASH_CARD,
+    SOURCE_PATH_CARD,
+    UUID_CARD,
+    FlatSequenceKey,
+    UnsafeIdentityError,
+    find_case_collision,
+    log_restore_report,
+    product_dir,
+    product_name,
+    publish_product,
+    reconcile_history,
+    scan_products,
+    source_digest,
+    validate_key,
+)
 
-# Camera key used when a frame carries no unit identity (e.g. direct mode,
-# which drives a single camera).
-DEFAULT_CAMERA = "default"
+__all__ = [
+    "DEFAULT_CAMERA",
+    "FlatFieldManager",
+    "FlatSequenceKey",
+    "load_image_hdu",
+    "validate_sk_flat_header",
+]
 
 
 @dataclass
@@ -64,12 +87,32 @@ class ExposureRecord:
 
 
 @dataclass
-class CameraFlatState:
-    """Per-camera flat collection state."""
+class FlatSequenceState:
+    """Collection state for one camera/filter sequence.
+
+    ``good_frames`` counts verified accepted products. ``next_sequence`` is
+    the next free filename number; it is kept separately so that gaps in the
+    numbering (e.g. a removed product) never imply accepted frames.
+    """
 
     good_frames: int = 0
+    next_sequence: int = 1
     next_exposure: float | None = None
     exposures: List[ExposureRecord] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _Frame:
+    """Identity and provenance of a frame being processed."""
+
+    path: Path
+    key: FlatSequenceKey
+    uuid: str | None
+    digest: str | None
+
+
+class FlatRejected(ValueError):
+    """A frame cannot be accepted for a reason other than image quality."""
 
 
 @dataclass
@@ -212,18 +255,22 @@ class FlatFieldManager:
         # decide how many frames to wait for on the next one.
         self._expected_cameras: int = 0
 
-        # Initialize state from run history if it exists
-        self.cameras: dict[str, CameraFlatState] = self._get_camera_state_from_history()
+        # Restore every camera/filter sequence from verified accepted products,
+        # reconciled with run history (see _restore_sequences).
+        self.cameras: dict[FlatSequenceKey, FlatSequenceState] = {}
+        self._accepted_sources: set[str] = set()
+        self._accepted_digests: set[str] = set()
+        self._restore_sequences()
         self.current_exposure = self.minimum_exposure  # Start with minimum exposure
 
-        logger.info(f"Initialized FlatFieldManager (target: {self.target_flats} flats per camera)")
+        logger.info(f"Initialized FlatFieldManager (target: {self.target_flats} flats per camera/filter)")
         logger.info(f"├── Count range: {self.min_counts:,} - {self.max_counts:,} ADU (target {self.target_counts:,.0f})")
         logger.info(f"├── Exposure range: {self.minimum_exposure}s - {self.maximum_exposure}s")
         logger.info(f"├── Sky doubling time: {self.sky_doubling_seconds}s")
         logger.info(f"├── Stats cutout: {self.cutout_size or 'full frame'}")
         logger.info(f"├── Max saturation: {self.max_saturation_percentage}%")
         logger.info(f"├── Saturation threshold: {self.saturation_threshold or 'auto-detect'}")
-        logger.info(f"└── Resuming from {self.good_frames} existing good frames ({len(self.cameras)} camera(s))")
+        logger.info(f"└── Resuming from {self.good_frames} existing good frames ({len(self.cameras)} sequence(s))")
 
     # ------------------------------------------------------------------
     # TaskSource protocol properties
@@ -248,7 +295,7 @@ class FlatFieldManager:
 
     @property
     def good_frames(self) -> int:
-        """Good frames of the camera furthest behind (collection is done when it is)."""
+        """Good frames of the camera/filter sequence furthest behind (done when it is)."""
         if not self.cameras:
             return 0
         return min(state.good_frames for state in self.cameras.values())
@@ -257,21 +304,28 @@ class FlatFieldManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_camera_state_from_history(self) -> dict[str, CameraFlatState]:
+    def _restore_sequences(self) -> None:
+        """Rebuild each camera/filter sequence from accepted products and history.
+
+        Counts come only from verified products on disk (plus attributable
+        legacy products); history is reconciled against them and anything
+        that does not match is reported, never counted. See
+        ``products.reconcile_history`` and ``docs/flats.md``.
         """
-        Reconstruct per-camera good-frame counts from run command history.
-        """
-        cameras: dict[str, CameraFlatState] = {}
-        for cmd in self.run.executed_commands:
-            if cmd["command"] != "flat_field_saved":
-                continue
-            metadata = cmd.get("metadata") or {}
-            camera = metadata.get("camera", DEFAULT_CAMERA)
-            good = metadata.get("frame_number")
-            if good is None:
-                good = int(cmd["result"].split("/")[0])  # Extract X from "X/Y flats collected"
-            cameras.setdefault(camera, CameraFlatState()).good_frames = int(good)
-        return cameras
+        output_directory = Path(self.run.output_directory)
+        restored = scan_products(
+            output_directory, sensorkit=self.sk_data_root is not None
+        )
+        reconcile_history(restored, output_directory, self.run.executed_commands)
+        log_restore_report(restored)
+        for key in sorted({*restored.products, *restored.legacy_counts}):
+            self.cameras[key] = FlatSequenceState(
+                good_frames=restored.accepted_count(key),
+                next_sequence=restored.next_sequence.get(key, 1),
+            )
+        self._accepted_sources = set(restored.source_paths)
+        self._accepted_digests = set(restored.source_hashes)
+        self.restore_report = restored
 
     def _is_dawn(self, when: datetime) -> bool:
         """True if ``when`` is after local midnight, i.e. the sky is brightening."""
@@ -303,8 +357,8 @@ class FlatFieldManager:
     def _shared_exposure(self) -> float:
         """One exposure for the next request, serving cameras still collecting.
 
-        Takes the median of the per-camera ideal exposures (re-projected to
-        now for sky change) over cameras that are not yet complete.
+        Takes the median of the per-sequence ideal exposures (re-projected to
+        now for sky change) over camera/filter sequences not yet complete.
         """
         candidates = []
         for state in self.cameras.values():
@@ -357,133 +411,280 @@ class FlatFieldManager:
         try:
             frame_path = Path(frame_path).resolve()
             logger.info(f"Processing flat field frame: {frame_path}")
-
             data, header = load_image_hdu(frame_path)
-            if device_control is None:
-                # SensorKit mode: identity must come from FITs header
-                camera, filter_name = validate_sk_flat_header(header)
-            else:
-                camera = str(header.get("UNITID") or DEFAULT_CAMERA).strip()
-                filter_name = str(header.get("FILTER", "")).strip() or None
-
-            state = self.cameras.setdefault(camera, CameraFlatState())
-
-            exposure_time = float(header.get("EXPTIME", 0) or self.current_exposure)
-            timestamp = _parse_date_obs(header.get("DATE-OBS"))
-            if timestamp is None:
-                logger.debug("No valid DATE-OBS in header, using current time")
-                timestamp = datetime.now(ZoneInfo("UTC"))
-
-            stats = self._frame_stats(data)
-            counts = stats.average_counts
-
-            logger.info(f"Frame statistics [{camera}] ({exposure_time:.3f}s):")
-            logger.info(f"├── Clipped mean: {counts:,.0f} ADU (median {stats.median_counts:,.0f}, std {stats.std_counts:,.0f})")
-            logger.info(f"├── Cutout min/max: {stats.min_counts:,.0f} / {stats.max_counts:,.0f} ADU")
-            logger.info(f"└── Saturation: {stats.saturation_percentage:.2f}% (threshold: {stats.saturation_threshold})")
-
-            counts_good = self.min_counts <= counts <= self.max_counts
-            saturation_good = stats.saturation_percentage <= self.max_saturation_percentage
-            # A camera that is already complete still updates its exposure
-            # model, but its extra frames are not kept.
-            is_good = counts_good and saturation_good and state.good_frames < self.target_flats
-
-            state.exposures.append(
-                ExposureRecord(
-                    timestamp=timestamp,
-                    exposure_time=exposure_time,
-                    median_counts=counts,
-                    saturation_percentage=stats.saturation_percentage,
-                    is_good=is_good,
-                )
-            )
-            state.next_exposure = self._next_exposure_for(exposure_time, counts, timestamp)
-            logger.info(f"[{camera}] ideal next exposure: {state.next_exposure:.3f}s")
-
-            if is_good:
-                self._save_good_frame(camera, filter_name, state, frame_path, stats, exposure_time, device_control)
-            elif state.good_frames >= self.target_flats:
-                logger.info(f"[{camera}] already has {state.good_frames} flats — frame not kept")
-            else:
-                self._log_rejection(camera, filter_name, stats, exposure_time, counts_good, saturation_good)
-
-            return is_good
-
+            frame = self._identify(frame_path, header, sensorkit=device_control is None)
+        except (FlatRejected, UnsafeIdentityError) as e:
+            logger.warning(f"Flat frame not accepted: {e}")
+            return False
         except Exception as e:
             logger.error(f"Error processing flat field frame: {str(e)}")
             logger.exception(e)  # Log full traceback
             return False
+        return self._measure_and_keep(frame, data, header, device_control)
+
+    def _identify(
+        self, frame_path: Path, header: fits.Header, *, sensorkit: bool
+    ) -> _Frame:
+        """Resolve a frame's camera/filter sequence and provenance.
+
+        SensorKit frames must carry a valid IMAGETYP/UNITID/FILTER identity
+        and a task UUID, and are rejected if this exact source frame was
+        already accepted (by path or content, including before a restart).
+        Direct mode keeps its fallback: missing UNITID is the default camera
+        and a missing FILTER is allowed.
+
+        Raises:
+            FlatRejected: Not a usable flat, duplicate source, or ambiguous identity.
+            UnsafeIdentityError: Camera or filter cannot be used as a path component.
+        """
+        if not sensorkit:
+            camera = _header_text(header, "UNITID") or DEFAULT_CAMERA
+            key = FlatSequenceKey(camera, _header_text(header, "FILTER") or None)
+            return _Frame(frame_path, validate_key(key), None, None)
+
+        try:
+            key = validate_key(FlatSequenceKey(*validate_sk_flat_header(header)))
+        except UnsafeIdentityError:
+            raise
+        except ValueError as e:
+            raise FlatRejected(str(e)) from e
+        uuid = _header_text(header, "SKTASKID") or _header_text(header, "TASKID")
+        if not uuid:
+            raise FlatRejected("SensorKit flat has no SKTASKID or TASKID")
+        collision = find_case_collision(key, self.cameras)
+        if collision is not None:
+            raise FlatRejected(
+                f"{key.label()} would share output with {collision.label()} on a case-insensitive filesystem"
+            )
+        digest = source_digest(frame_path)
+        if (
+            str(frame_path) in self._accepted_sources
+            or digest in self._accepted_digests
+        ):
+            raise FlatRejected(f"source frame {frame_path} was already accepted")
+        return _Frame(frame_path, key, uuid, digest)
+
+    def _measure_and_keep(
+        self, frame: _Frame, data: np.ndarray, header: fits.Header, device_control
+    ) -> bool:
+        """Measure a frame, update its sequence's exposure model, and keep it if good."""
+        key = frame.key
+        state = self.cameras.get(key, FlatSequenceState())
+        exposure_time = float(header.get("EXPTIME", 0) or self.current_exposure)
+        timestamp = _parse_date_obs(header.get("DATE-OBS"))
+        if timestamp is None:
+            logger.debug("No valid DATE-OBS in header, using current time")
+            timestamp = datetime.now(ZoneInfo("UTC"))
+
+        stats = self._frame_stats(data)
+        counts = stats.average_counts
+
+        logger.info(f"Frame statistics [{key.label()}] ({exposure_time:.3f}s):")
+        logger.info(
+            f"├── Clipped mean: {counts:,.0f} ADU (median {stats.median_counts:,.0f}, std {stats.std_counts:,.0f})"
+        )
+        logger.info(
+            f"├── Cutout min/max: {stats.min_counts:,.0f} / {stats.max_counts:,.0f} ADU"
+        )
+        logger.info(
+            f"└── Saturation: {stats.saturation_percentage:.2f}% (threshold: {stats.saturation_threshold})"
+        )
+
+        counts_good = self.min_counts <= counts <= self.max_counts
+        saturation_good = stats.saturation_percentage <= self.max_saturation_percentage
+        # A sequence that is already complete still updates its exposure
+        # model, but its extra frames are not kept.
+        is_good = (
+            counts_good and saturation_good and state.good_frames < self.target_flats
+        )
+
+        self.cameras[key] = state
+        state.exposures.append(
+            ExposureRecord(
+                timestamp=timestamp,
+                exposure_time=exposure_time,
+                median_counts=counts,
+                saturation_percentage=stats.saturation_percentage,
+                is_good=is_good,
+            )
+        )
+        state.next_exposure = self._next_exposure_for(exposure_time, counts, timestamp)
+        logger.info(f"[{key.label()}] ideal next exposure: {state.next_exposure:.3f}s")
+
+        if is_good:
+            return self._save_good_frame(
+                frame, state, stats, exposure_time, timestamp, device_control
+            )
+        if state.good_frames >= self.target_flats:
+            logger.info(
+                f"[{key.label()}] already has {state.good_frames} flats — frame not kept"
+            )
+        else:
+            self._log_rejection(key, stats, exposure_time, counts_good, saturation_good)
+        return False
 
     def _save_good_frame(
         self,
-        camera: str,
-        filter_name: str | None,
-        state: CameraFlatState,
-        frame_path: Path,
+        frame: _Frame,
+        state: FlatSequenceState,
         stats: FrameStats,
         exposure_time: float,
+        acquired: datetime,
         device_control,
-    ) -> None:
-        """Save a good flat to the run's flats directory and log it to history."""
-        state.good_frames += 1
-        output_dir = Path(self.run.output_directory) / "data" / "flats"
-        if camera != DEFAULT_CAMERA:
-            output_dir = output_dir / camera
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"flat_{state.good_frames:03d}.fits"
+    ) -> bool:
+        """Publish a good flat, then count it and record it in history.
 
-        logger.success(f"Good flat frame [{camera}] ({state.good_frames}/{self.target_flats}):")
+        Nothing is counted or recorded unless publication succeeded, so a
+        failed write leaves state, history, existing products and the source
+        as they were. Returns True if the product was published.
+        """
+        key = frame.key
+        sequence = state.next_sequence
+        output_dir = product_dir(Path(self.run.output_directory), key)
+        if device_control is None:
+            output_path = output_dir / product_name(key, acquired, sequence, frame.uuid)
+        else:
+            output_path = output_dir / f"flat_{sequence:03d}.fits"
+
+        try:
+            self._publish(
+                frame,
+                output_path,
+                self._product_cards(frame, sequence, stats),
+                device_control,
+            )
+        except FileExistsError:
+            logger.error(
+                f"[{key.label()}] refusing to overwrite existing flat {output_path}; frame not kept"
+            )
+            state.next_sequence = sequence + 1  # that number is taken; never reuse it
+            return False
+        except (OSError, ValueError, fits.VerifyError) as e:
+            # Write, link or verification failure: nothing was published.
+            logger.error(
+                f"[{key.label()}] could not publish flat {output_path}: {e}; frame not kept"
+            )
+            return False
+
+        state.next_sequence = sequence + 1
+        state.good_frames += 1
+        if frame.digest is not None:
+            self._accepted_sources.add(str(frame.path))
+            self._accepted_digests.add(frame.digest)
+
+        logger.success(
+            f"Good flat frame [{key.label()}] ({state.good_frames}/{self.target_flats}):"
+        )
         logger.info(f"├── Clipped mean counts: {stats.average_counts:,.0f}")
         logger.info(f"├── Saturation: {stats.saturation_percentage:.2f}%")
         logger.info(f"├── Exposure time: {exposure_time:.3f}s")
-        logger.info(f"└── Saving to: {output_path}")
+        logger.info(f"└── Saved to: {output_path}")
 
         self.run.log_command(
             "flat_field_saved",
             f"{state.good_frames}/{self.target_flats} flats collected",
             {
-                "camera": camera,
-                "filter": filter_name,
+                "camera": key.camera,
+                "filter": key.filter,
                 "frame_number": state.good_frames,
+                "sequence": sequence,
                 "median_counts": stats.average_counts,
                 "saturation_percentage": stats.saturation_percentage,
                 "exposure_time": exposure_time,
-                "source_path": str(frame_path),
+                "source_path": str(frame.path),
+                "source_sha256": frame.digest,
+                "task_uuid": frame.uuid,
                 "output_path": str(output_path.relative_to(self.run.output_directory)),
             },
         )
+        return True
 
-        extra_headers = {
+    def _product_cards(
+        self, frame: _Frame, sequence: int, stats: FrameStats
+    ) -> dict[str, tuple]:
+        """Header cards stamped on an accepted product."""
+        key = frame.key
+        cards = {
             "IMAGETYP": ("FLAT", "Type of image"),
             "MEDIAN": (stats.median_counts, "Clipped median counts in cutout"),
             "MEAN": (stats.average_counts, "Clipped mean counts in cutout"),
             "STDDEV": (stats.std_counts, "Clipped std dev of counts in cutout"),
             "MINCNTS": (stats.min_counts, "Minimum counts in cutout"),
             "MAXCNTS": (stats.max_counts, "Maximum counts in cutout"),
-            "FLATSNUM": (state.good_frames, "Flat field sequence number"),
+            "FLATSNUM": (sequence, "Flat field sequence number"),
+            SEQUENCE_CARD: (sequence, "Camera/filter sequence number"),
             "SATPCT": (stats.saturation_percentage, "Percentage of saturated pixels"),
             "SATTHRES": (stats.saturation_threshold, "Saturation threshold used"),
         }
-        if camera != DEFAULT_CAMERA:
-            extra_headers["UNITID"] = (camera, "Camera unit identifier")
-        if filter_name is not None:
-            extra_headers["FILTER"] = (filter_name, "Filter reported by the camera")
+        if key.camera != DEFAULT_CAMERA:
+            cards["UNITID"] = (key.camera, "Camera unit identifier")
+        if key.filter is not None:
+            cards["FILTER"] = (key.filter, "Filter reported by the camera")
+        if frame.digest is not None:
+            # FITS string cards hold 68 characters; long paths keep the hash only.
+            if len(str(frame.path)) <= 68:
+                cards[SOURCE_PATH_CARD] = (
+                    str(frame.path),
+                    "Resolved source frame path",
+                )
+            cards[SOURCE_HASH_CARD] = (frame.digest, "SHA-256 of the source frame")
+            cards[UUID_CARD] = (frame.uuid, "SensorKit/burr task UUID")
+        return cards
 
-        # Save using device control's save_fits to include all metadata
-        # (direct path), or copy the SK-written FITS and stamp
-        # flat-specific headers into it (SK path).
-        if device_control is not None:
+    def _publish(
+        self, frame: _Frame, output_path: Path, cards: dict[str, tuple], device_control
+    ) -> None:
+        """Publish the product without ever overwriting ``output_path``.
+
+        SK mode copies the source frame and stamps ``cards``. Direct mode has
+        ``device_control.save_fits`` write the camera's last image (with
+        ``cards``) into the temporary file instead. Both then go through the
+        same verify-and-link publication.
+
+        Raises:
+            FileExistsError: ``output_path`` already exists.
+            Exception: The write or verification failed.
+        """
+        if device_control is None:
+            publish_product(
+                frame.path,
+                output_path,
+                cards,
+                verify=lambda path: self._verify_product(path, frame),
+            )
+            return
+
+        def save(temp: Path) -> None:
             device_control.save_fits(
-                output_path=output_path,
+                output_path=temp,
                 tracking_mode=TrackingMode.OFF,
                 rates=None,
-                extra_headers=extra_headers,
+                extra_headers=cards,
             )
-        else:
-            self._copy_and_stamp_flat(src=frame_path, dst=output_path, extra_headers=extra_headers)
+
+        publish_product(None, output_path, cards, verify=lambda path: None, write=save)
+
+    def _verify_product(self, path: Path, frame: _Frame) -> None:
+        """Check a stamped temporary product before it is published.
+
+        Raises:
+            ValueError: The product's identity or provenance does not match the frame.
+        """
+        _, header = load_image_hdu(path)
+        if FlatSequenceKey(*validate_sk_flat_header(header)) != frame.key:
+            raise ValueError(
+                f"stamped product does not carry identity {frame.key.label()}"
+            )
+        if _header_text(header, SOURCE_HASH_CARD) != frame.digest:
+            raise ValueError("stamped product does not carry the source hash")
 
     def _log_rejection(
-        self, camera: str, filter_name: str | None, stats: FrameStats, exposure_time: float, counts_good: bool, saturation_good: bool
+        self,
+        key: FlatSequenceKey,
+        stats: FrameStats,
+        exposure_time: float,
+        counts_good: bool,
+        saturation_good: bool,
     ) -> None:
         """Log why a flat frame was rejected, to the log and run history."""
         rejection_reasons = []
@@ -497,14 +698,14 @@ class FlatFieldManager:
             )
 
         reason = " and ".join(rejection_reasons)
-        logger.warning(f"Frame rejected [{camera}] - {reason}")
+        logger.warning(f"Frame rejected [{key.label()}] - {reason}")
 
         self.run.log_command(
             "flat_field_rejected",
             f"Frame rejected: {reason}",
             {
-                "camera": camera,
-                "filter": filter_name,
+                "camera": key.camera,
+                "filter": key.filter,
                 "median_counts": stats.average_counts,
                 "saturation_percentage": stats.saturation_percentage,
                 "exposure_time": exposure_time,
@@ -534,7 +735,9 @@ class FlatFieldManager:
         """
         # Check if we're done
         if self.is_collection_complete():
-            logger.success(f"Flat collection complete! Collected {self.good_frames} good frames per camera")
+            logger.success(
+                f"Flat collection complete! Collected {self.good_frames} good frames per camera/filter"
+            )
             return None
 
         # Re-project every camera's ideal exposure to now (the sky has moved
@@ -565,33 +768,12 @@ class FlatFieldManager:
         return request
 
     def is_collection_complete(self) -> bool:
-        """Check if every camera seen so far has enough good flats."""
-        return bool(self.cameras) and self.good_frames >= self.target_flats
+        """Check if every camera/filter sequence seen so far has enough good flats.
 
-    def _copy_and_stamp_flat(
-        self,
-        src: Path,
-        dst: Path,
-        extra_headers: dict,
-    ) -> None:
-        """Copy an SK-written FITS into the flats dir and add flat headers.
-
-        The source FITS already carries SK's full per-frame metadata
-        (camera, mount, site headers written by SK's data graph). We
-        only need to stamp burr's flat-specific keys onto the image HDU
-        (the compressed HDU when SK compressed the frame) and write the
-        result to the canonical flats path.
+        Only sequences that have produced a frame are known, so this cannot
+        tell whether every expected camera/filter pair has been collected.
         """
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        with fits.open(dst, mode="update") as hdul:
-            image_hdus = [hdu for hdu in hdul if hdu.data is not None]
-            header = (image_hdus[0] if image_hdus else hdul[0]).header
-            for key, value in extra_headers.items():
-                if isinstance(value, tuple):
-                    header[key] = value
-                else:
-                    header[key] = (value, f"Added header {key}")
+        return bool(self.cameras) and self.good_frames >= self.target_flats
 
     def on_request_completed(
         self, request: ObservationRequest, duration_seconds: float
@@ -637,8 +819,11 @@ class FlatFieldManager:
         self._expected_cameras = max(self._expected_cameras, len(frame_paths))
 
         logger.info(
-            "Per-camera flats: "
-            + ", ".join(f"{cam}={state.good_frames}" for cam, state in sorted(self.cameras.items()))
+            "Flats per camera/filter: "
+            + ", ".join(
+                f"{key.label()}={state.good_frames}"
+                for key, state in sorted(self.cameras.items())
+            )
         )
 
     def _wait_for_sk_flats(self, request: ObservationRequest) -> list[Path]:
