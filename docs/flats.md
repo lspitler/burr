@@ -304,9 +304,10 @@ These are known and left for later milestones:
 - **Without a plan**, behaviour is unchanged: each request uses one shared
   exposure, SensorKit chooses a single camera for it, and completion covers
   only pairs seen so far. Planned collection (above) resolves all three.
-- **One filter per pair per request.** A plan with several filters on one
-  camera collects them in separate requests, one pair per camera at a time,
-  so a camera's filters are not interleaved within a twilight.
+- **Fixed filter order.** A camera with several planned filters takes all of
+  them in each request, one after another, in plan order (on 11-09: Lum, g,
+  then r on C0, C1 and C3). The order does not depend on the filters or on
+  whether it is dusk or dawn. See "Next change: filter-aware ordering".
 - **No preflight filter check.** burr does not read the wheels' filter lists
   before requesting; an unavailable filter is discovered when SensorKit
   plans the collect, which fails the whole request.
@@ -316,7 +317,100 @@ These are known and left for later milestones:
   modification time and `IMAGETYP`; only planned collection matches by
   task ID.
 
-Recommended next milestone: a preflight that checks each planned wheel's
-reported filters, so an unavailable pair is skipped and reported before the
-request is sent instead of failing it; then per-camera filter sequencing
-within one twilight.
+Recommended next milestones, in order: filter-aware ordering and starting
+exposures (below); a preflight that checks each planned wheel's reported
+filters, so an unavailable pair is skipped and reported before the request
+is sent instead of failing it.
+
+## Next change: filter-aware ordering and starting exposures
+
+**Status:** proposed, not implemented.
+
+### Problem
+
+burr has no knowledge of a filter's bandwidth or wavelength:
+
+- **Order** comes only from the plan's list. On a camera with several filters,
+  SensorKit takes them in that order, the same at dusk and at dawn.
+- **Starting exposure** is `minimum_exposure_seconds` for every pair, Lum or
+  narrowband alike. A pair's exposure only adapts after it has taken a frame.
+
+Twilight flats want the opposite. Filters differ hugely in throughput, and the
+sky changes by about 2x every 3 minutes, so each filter should be taken while
+the sky suits it:
+
+- **Dusk** (sky darkening): lowest throughput first, while there is still
+  light; highest last. For example narrowband, then r, g, Lum.
+- **Dawn** (sky brightening): highest throughput first, in the faint early
+  sky; lowest last. For example Lum, then g, r, narrowband.
+
+Measured on 11-09 evening (Huntsman, 60 s, same request):
+
+| Camera | Lum | g | r |
+|---|---|---|---|
+| C0 | 4,070 | 2,804 | 854 |
+| C1 | 4,158 | 2,872 | 887 |
+| C3 | 4,265 | 2,958 | 884 |
+
+So Lum ≈ 1.4× g ≈ 4.6× r. With plan order Lum, g, r at dusk, r was taken
+last, in the darkest sky, the worst case for the faintest filter. (r is
+fainter than g here although sunset light is red; the post-sunset sky is
+blue. Don't build a colour assumption in; measure.)
+
+### Proposal
+
+1. **Per-filter throughput in the plan.** A new optional mapping on
+   `FlatPlanConfig`, relative to a reference filter:
+
+   ```yaml
+   plan:
+     frames_per_pair: 10
+     filter_throughput:   # counts per second relative to Lum; higher = brighter
+       Lum: 1.0
+       g: 0.69
+       r: 0.21
+       Halpha: 0.02
+     pairs: [...]
+   ```
+
+   Validation: values > 0; every filter in `pairs` must be listed, or none
+   (then ordering falls back to plan order, as today). Names follow the same
+   rules as `filter`.
+
+2. **Order each camera's pairs by throughput, flipping at dawn.** In
+   `_planned_request`, sort `remaining_pairs()` per camera by throughput,
+   ascending at dusk and descending at dawn (`_is_dawn(now)`). SensorKit keeps
+   the order of a task's `CameraParameterSet` list per instrument (verified
+   on 11-09: the wheel went Lum → g → r in that order), so no SensorKit
+   change is needed.
+
+3. **Throughput-scaled starting exposure.** A pair with no frames yet starts
+   at `initial_exposure_seconds / throughput` for its filter (clipped to the
+   min/max), instead of `minimum_exposure_seconds`. Once any pair on a camera
+   has a measured frame, derive the others from it:
+   `t_new = t_measured × (throughput_measured / throughput_new)`. That saves
+   the first rejected frames per filter, which is most of the cost in a
+   ~30 min window.
+
+4. **`initial_exposure_seconds`** (new; default 1.0) replaces
+   `minimum_exposure_seconds` as the first exposure. On 11-09 the 0.1 s
+   start gave bias-level frames (~162 ADU), giving the scaling nothing to
+   work from.
+
+5. **Optional: learn throughput.** Log each pair's measured
+   counts-per-second, so the `filter_throughput` table can be refreshed from
+   data rather than estimated.
+
+### Tests to add
+
+- Dusk orders lowest-throughput first; dawn reverses it; no table keeps plan order.
+- First exposure per filter scales by throughput, within the min/max.
+- A measured pair seeds an unmeasured pair on the same camera.
+- Validation: a non-positive throughput, or a planned filter missing from a partial table, is rejected.
+- End to end (sensorkit `modules/burr/tests`): the planned task's parameter-set order per
+  instrument matches the throughput order, and pack keeps it.
+
+### Non-goals
+
+- Time-splitting one camera's filters into separate windows within a twilight.
+- Per-filter count targets (all pairs share `min_counts`/`max_counts`).
