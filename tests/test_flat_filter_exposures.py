@@ -263,3 +263,56 @@ def test_recent_record_in_the_same_twilight_is_still_used(tmp_path):
     )
 
     assert manager._pair_exposure(FlatSequenceKey("C0", "r"), now=NOW) == pytest.approx(10.0, rel=1e-6)
+
+
+def _twilight_manager(tmp_path, *, dawn, dusk_initial=1.0, dawn_initial=60.0, **kw):
+    pairs = [_pair("C0", "g"), _pair("C0", "r")]
+    config = TwilightFlatsConfig(
+        initial_exposure_seconds=1.0,
+        initial_exposure_dusk_seconds=dusk_initial,
+        initial_exposure_dawn_seconds=dawn_initial,
+        minimum_exposure_seconds=0.1,
+        maximum_exposure_seconds=kw.pop("maximum", 60.0),
+        plan={"pairs": pairs, "filter_throughput": kw.pop("throughput", {"g": 1.0, "r": 0.34})},
+    )
+    midnight = NOW - timedelta(hours=4) if dawn else NOW + timedelta(hours=4)
+    run = SimpleNamespace(
+        config=SimpleNamespace(schedule=SimpleNamespace(twilight_flats=config)),
+        executed_commands=[],
+        output_directory=tmp_path / "processed",
+        lighting_schedule=SimpleNamespace(local_midnight=midnight),
+        log_command=lambda *args, **kwargs: None,
+    )
+    return FlatFieldManager(run, sk_data_root=tmp_path / "raw")
+
+
+def test_dusk_uses_the_dusk_reference_exposure(tmp_path):
+    manager = _twilight_manager(tmp_path, dawn=False, dusk_initial=1.0, dawn_initial=60.0)
+    assert manager._pair_exposure(FlatSequenceKey("C0", "g"), now=NOW) == pytest.approx(1.0)
+    assert manager._pair_exposure(FlatSequenceKey("C0", "r"), now=NOW) == pytest.approx(1.0 / 0.34)
+
+
+def test_dawn_uses_the_dawn_reference_exposure_then_throughput_scaling(tmp_path):
+    manager = _twilight_manager(tmp_path, dawn=True, dusk_initial=1.0, dawn_initial=20.0)
+    assert manager._pair_exposure(FlatSequenceKey("C0", "g"), now=NOW) == pytest.approx(20.0)
+    # Same throughput scaling as at dusk, from the dawn reference.
+    assert manager._pair_exposure(FlatSequenceKey("C0", "r"), now=NOW) == pytest.approx(20.0 / 0.34)
+
+
+def test_dawn_reference_at_the_cap_clips_fainter_filters_to_the_cap(tmp_path):
+    manager = _twilight_manager(tmp_path, dawn=True, dawn_initial=60.0, maximum=60.0)
+    assert manager._pair_exposure(FlatSequenceKey("C0", "g"), now=NOW) == pytest.approx(60.0)
+    assert manager._pair_exposure(FlatSequenceKey("C0", "r"), now=NOW) == pytest.approx(60.0)  # 176 s -> cap
+
+
+def test_per_twilight_references_default_to_initial_exposure_seconds(tmp_path):
+    config = TwilightFlatsConfig(initial_exposure_seconds=2.5)
+    assert config.initial_exposure_dusk_seconds is None and config.initial_exposure_dawn_seconds is None
+    for dawn in (False, True):
+        manager = _manager(tmp_path, pairs=[_pair("C0", "g")], throughput={"g": 1.0}, initial=2.5, dawn=dawn)
+        assert manager._pair_exposure(FlatSequenceKey("C0", "g"), now=NOW) == pytest.approx(2.5)
+
+
+def test_dawn_reference_without_a_throughput_table(tmp_path):
+    manager = _twilight_manager(tmp_path, dawn=True, dawn_initial=30.0, throughput=None)
+    assert manager._pair_exposure(FlatSequenceKey("C0", "g"), now=NOW) == pytest.approx(30.0)

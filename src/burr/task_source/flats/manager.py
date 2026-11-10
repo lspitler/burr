@@ -270,6 +270,8 @@ class FlatFieldManager:
         self.target_counts = (self.min_counts + self.max_counts) / 2
         self.minimum_exposure = self.config.minimum_exposure_seconds
         self.initial_exposure = self.config.initial_exposure_seconds
+        self.initial_exposure_dusk = self.config.initial_exposure_dusk_seconds or self.initial_exposure
+        self.initial_exposure_dawn = self.config.initial_exposure_dawn_seconds or self.initial_exposure
         self.twilight_record_max_age = self.config.twilight_record_max_age_seconds
         self.maximum_exposure = self.config.maximum_exposure_seconds
         self.sky_doubling_seconds = self.config.sky_doubling_seconds
@@ -906,6 +908,16 @@ class FlatFieldManager:
         return request
 
 
+    def _initial_exposure(self, now: datetime) -> float:
+        """Reference-filter first exposure for the twilight ``now`` is in.
+
+        Dusk starts in a bright sky and dawn in a dark one, so each has its
+        own reference (``initial_exposure_dusk_seconds`` /
+        ``initial_exposure_dawn_seconds``, both defaulting to
+        ``initial_exposure_seconds``). Throughput scaling is applied to it.
+        """
+        return self.initial_exposure_dawn if self._is_dawn(now) else self.initial_exposure_dusk
+
     def _clip_exposure(self, exposure: float) -> float:
         """Clip an exposure to the configured hardware limits."""
         return float(
@@ -982,8 +994,9 @@ class FlatFieldManager:
                       else None)
         
         # without relative filter data use reference start
+        reference = self._initial_exposure(now)
         if throughput is None:
-            return self._clip_exposure(self.initial_exposure)
+            return self._clip_exposure(reference)
 
         if key.filter is None:
             raise ValueError(f"planned flat pair {key.label()} has no filter")
@@ -994,7 +1007,7 @@ class FlatFieldManager:
             estimate = (record.exposure_time * throughput[source_key.filter] / throughput[key.filter])
 
         else:
-            estimate = (self.initial_exposure / throughput[key.filter])
+            estimate = (reference / throughput[key.filter])
 
         return self._clip_exposure(estimate)
 

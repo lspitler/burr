@@ -124,6 +124,16 @@ class TwilightFlatsConfig(BaseModel):
     collect: bool = Field(default=True, description="Whether to collect flats")
     n_frames: int = Field(default=20, description="Number of frames to collect")
     initial_exposure_seconds: float = Field(default=1.0, gt=0, description="Reference-filter exposure used before any current-twilight measurement" )
+    initial_exposure_dusk_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        description="Reference exposure at dusk (sky darkening from bright); defaults to initial_exposure_seconds",
+    )
+    initial_exposure_dawn_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        description="Reference exposure at dawn (sky brightening from dark); defaults to initial_exposure_seconds",
+    )
     twilight_record_max_age_seconds: float = Field(
         default=7200.0,
         gt=0,
