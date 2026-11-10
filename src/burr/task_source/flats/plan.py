@@ -101,6 +101,14 @@ class FlatPlanConfig(BaseModel):
             "ordered by filter_wavelength_nm (dusk red to blue, dawn blue to red)"
         ),
     )
+    filter_phase_order: Literal["wavelength", "throughput"] = Field(
+        default="wavelength",
+        description=(
+            "per_filter phase order. wavelength: dusk red to blue, dawn blue to red "
+            "(needs filter_wavelength_nm). throughput: dusk faintest first, dawn "
+            "brightest first (needs filter_throughput), the same sort as batched mode"
+        ),
+    )
     filter_wavelength_nm: dict[str, float] | None = Field(
         default=None,
         description="Effective wavelength per planned filter (nm); required for per_filter",
@@ -170,8 +178,10 @@ class FlatPlanConfig(BaseModel):
             _check_throughput_covers_plan(self.filter_throughput, self.pairs, "filter_throughput")
         if self.filter_wavelength_nm is not None:
             _check_throughput_covers_plan(self.filter_wavelength_nm, self.pairs, "filter_wavelength_nm")
-        if self.filter_sequencing == "per_filter" and self.filter_wavelength_nm is None:
-            raise ValueError("filter_sequencing: per_filter needs filter_wavelength_nm to order the filters")
+        if self.filter_sequencing == "per_filter":
+            needed = "filter_wavelength_nm" if self.filter_phase_order == "wavelength" else "filter_throughput"
+            if getattr(self, needed) is None:
+                raise ValueError(f"filter_phase_order: {self.filter_phase_order} needs {needed} to order the filters")
         return self
 
     def target(self, pair: FlatPairPlan) -> int:

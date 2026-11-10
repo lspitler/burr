@@ -150,3 +150,36 @@ def test_per_filter_config_is_validated(bad):
     plan = {"pairs": pairs, "filter_sequencing": "per_filter", "filter_wavelength_nm": {"g": 475.0, "r": 620.0}, **bad}
     with pytest.raises(ValueError):
         TwilightFlatsConfig(plan=plan)
+
+
+def _throughput_manager(tmp_path, *, dawn):
+    filters = ["g", "r", "i", "z", "u"]
+    config = TwilightFlatsConfig(
+        minimum_exposure_seconds=0.1, maximum_exposure_seconds=60.0, min_counts=25000, max_counts=50000,
+        plan={
+            "frames_per_pair": 3,
+            "pairs": [_pair("C3", f) for f in filters] + [_pair("C0", "g"), _pair("C0", "r")],
+            "filter_sequencing": "per_filter",
+            "filter_phase_order": "throughput",
+            "filter_throughput": {f: THROUGHPUT[f] for f in filters},
+        },
+    )
+    midnight = NOW - timedelta(hours=4) if dawn else NOW + timedelta(hours=4)
+    run = SimpleNamespace(config=SimpleNamespace(schedule=SimpleNamespace(twilight_flats=config)), executed_commands=[],
+                          output_directory=tmp_path / "processed", lighting_schedule=SimpleNamespace(local_midnight=midnight),
+                          log_command=lambda *a, **k: None)
+    return FlatFieldManager(run, sk_data_root=tmp_path / "raw")
+
+
+def test_throughput_phase_order_dusk_faintest_first(tmp_path):
+    assert _phase(_throughput_manager(tmp_path, dawn=False)) == {("C3", "u"), ("C0", "r")}
+
+
+def test_throughput_phase_order_dawn_brightest_first(tmp_path):
+    assert _phase(_throughput_manager(tmp_path, dawn=True)) == {("C3", "g"), ("C0", "g")}
+
+
+def test_throughput_phase_order_needs_a_throughput_table():
+    with pytest.raises(ValueError, match="needs filter_throughput"):
+        TwilightFlatsConfig(plan={"pairs": [_pair("C0", "g")], "filter_sequencing": "per_filter",
+                                  "filter_phase_order": "throughput"})

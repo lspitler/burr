@@ -393,20 +393,24 @@ class FlatFieldManager:
     def _filter_phase_pairs(self, now: datetime) -> list[FlatSequenceKey]:
         """``per_filter`` sequencing: each camera's current filter, one pair per camera.
 
-        A camera's filters are taken one at a time in wavelength order: dusk
-        from red to blue, dawn from blue to red. A camera moves to its next
+        A camera's filters are taken one at a time, in ``filter_phase_order``:
+        ``wavelength`` (dusk red to blue, dawn blue to red) or ``throughput``
+        (dusk faintest first, dawn brightest first). A camera moves to its next
         filter once the current one is complete or exhausted for this
         twilight. All cameras run concurrently, each on its own phase, so a
         filter only one camera has never holds the others up.
         """
-        wavelength = self.plan.filter_wavelength_nm
         dawn = self._is_dawn(now)
+        if self.plan.filter_phase_order == "throughput":
+            table, reverse = self.plan.filter_throughput, dawn  # dusk ascending (faint first), dawn bright first
+        else:
+            table, reverse = self.plan.filter_wavelength_nm, not dawn  # dusk red first, dawn blue first
         by_camera: dict[str, list[FlatSequenceKey]] = {}
         for key in self.remaining_pairs():
             by_camera.setdefault(key.camera, []).append(key)
         phase = []
         for keys in by_camera.values():
-            ordered = sorted(keys, key=lambda k: wavelength[k.filter], reverse=not dawn)
+            ordered = sorted(keys, key=lambda k: table[k.filter], reverse=reverse)
             current = next((k for k in ordered if not self._phase_exhausted(k, now)), None)
             if current is not None:
                 phase.append(current)
