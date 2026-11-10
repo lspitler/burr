@@ -135,6 +135,18 @@ def test_twilight_config_accepts_filter_throughput():
     assert config.plan.filter_throughput["r"] == 0.21
 
 
+def test_initial_exposure_defaults_to_one_second():
+    config = TwilightFlatsConfig()
+
+    assert config.initial_exposure_seconds == 1.0
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_initial_exposure_must_be_positive(value):
+    with pytest.raises(ValidationError):
+        TwilightFlatsConfig(initial_exposure_seconds=value)
+
+
 @pytest.mark.parametrize(
     "pairs, message",
     [
@@ -226,11 +238,11 @@ def test_a_plan_requires_sensorkit_mode(tmp_path):
         FlatFieldManager(_run(tmp_path, config), sk_data_root=None)
 
 
-def test_without_a_plan_requests_and_completion_are_unchanged(tmp_path):
+def test_without_a_plan_uses_initial_exposure_and_completion_is_unchanged(tmp_path):
     config = TwilightFlatsConfig(windows=["nautical_twilight"], n_frames=2)
     manager = FlatFieldManager(_run(tmp_path, config), sk_data_root=tmp_path / "raw")
     assert manager.plan is None and manager.cameras == {}
     request = manager.generate_request(task_id="t")
     assert "flat_plan" not in request.metadata
-    assert request.exposure_seconds == [manager.minimum_exposure]
+    assert request.exposure_seconds == [manager.initial_exposure]
     assert not manager.is_collection_complete()

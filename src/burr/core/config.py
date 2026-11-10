@@ -123,6 +123,7 @@ class TwilightFlatsConfig(BaseModel):
     windows: List[str] = Field(default_factory=list, description="Lighting conditions for collection")
     collect: bool = Field(default=True, description="Whether to collect flats")
     n_frames: int = Field(default=20, description="Number of frames to collect")
+    initial_exposure_seconds: float = Field(default=1.0, gt=0, description="Reference-filter exposure used before any current-twilight measurement" )
     minimum_exposure_seconds: float = Field(default=0.1, description="Minimum exposure time in seconds")
     min_counts: int = Field(default=30000, description="Minimum ADU counts")
     max_counts: int = Field(default=50000, description="Maximum ADU counts")

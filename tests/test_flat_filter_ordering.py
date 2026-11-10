@@ -146,9 +146,14 @@ def test_planned_request_uses_order_and_one_request_time(tmp_path, monkeypatch):
         ("C1", "Lum"),
     ]
     assert manager._request_started_at == NOW
-    assert {
-        entry["exposure_seconds"] for entry in request.metadata["flat_plan"]
-    } == {manager.minimum_exposure}
+    exposures = {
+        (entry["camera"], entry["filter"]): entry["exposure_seconds"]
+        for entry in request.metadata["flat_plan"]
+    }
+    for camera in ("C0", "C1"):
+        assert exposures[(camera, "Lum")] == pytest.approx(1.0)
+        assert exposures[(camera, "g")] == pytest.approx(1.0 / 0.69)
+        assert exposures[(camera, "r")] == pytest.approx(1.0 / 0.21)
 
 
 def test_pair_exposure_uses_the_request_time(tmp_path):

@@ -269,6 +269,7 @@ class FlatFieldManager:
         self.max_counts = self.config.max_counts
         self.target_counts = (self.min_counts + self.max_counts) / 2
         self.minimum_exposure = self.config.minimum_exposure_seconds
+        self.initial_exposure = self.config.initial_exposure_seconds
         self.maximum_exposure = self.config.maximum_exposure_seconds
         self.sky_doubling_seconds = self.config.sky_doubling_seconds
         self.cutout_size = self.config.cutout_size
@@ -307,7 +308,7 @@ class FlatFieldManager:
                 f"Accepted flats exist for {key.label()}, which is not in the flat plan; "
                 f"left in place and not counted toward completion"
             )
-        self.current_exposure = self.minimum_exposure  # Start with minimum exposure
+        self.current_exposure = self._clip_exposure(self.initial_exposure)
 
         logger.info(f"Initialized FlatFieldManager (target: {self.target_flats} flats per camera/filter)")
         logger.info(f"├── Count range: {self.min_counts:,} - {self.max_counts:,} ADU (target {self.target_counts:,.0f})")
@@ -903,21 +904,88 @@ class FlatFieldManager:
 
         return request
 
+
+    def _clip_exposure(self, exposure: float) -> float:
+        """Clip an exposure to the configured hardware limits."""
+        return float(
+            np.clip(
+                exposure,
+                self.minimum_exposure,
+                self.maximum_exposure,
+            )
+        )
+
+    def _current_twilight_record(
+        self,
+        state: FlatSequenceState,
+        now: datetime,
+    ) -> ExposureRecord | None:
+        """Return the newest record from the same dusk/dawn as ``now``."""
+        dawn = self._is_dawn(now)
+        candidates = [
+            record
+            for record in state.exposures
+            if self._is_dawn(record.timestamp) == dawn
+        ]
+
+        return max(
+            candidates,
+            key=lambda record: record.timestamp,
+            default=None,
+        )
+
     def _pair_exposure(
         self, key: FlatSequenceKey, *, now: datetime | None = None
     ) -> float:
-        """Return this pair's ideal exposure at ``now``."""
+        """Return the best exposure estimate for a planned pair"""
+        if now is None:
+            now = datetime.now(ZoneInfo("UTC"))
         state = self.cameras[key]
-        if not state.exposures:
-            return self.minimum_exposure
+        own_record = self._current_twilight_record(state, now)
 
-        last = state.exposures[-1]
-        return self._next_exposure_for(
-            last.exposure_time,
-            last.median_counts,
-            last.timestamp,
-            now=now,
-        )
+        # once the pair has its own current-twilight measurement
+        # normal count feedback takes precedence
+
+        if own_record is not None:
+            return self._next_exposure_for(
+                own_record.exposure_time,
+                own_record.median_counts,
+                own_record.timestamp,
+                now=now,
+            )
+        throughput = (self.plan.filter_throughput
+                      if self.plan is not None
+                      else None)
+        
+        # without relative filter data use reference start
+        if throughput is None:
+            return self._clip_exposure(self.initial_exposure)
+
+        if key.filter is None:
+            raise ValueError(f"planned flat pair {key.label()} has no filter")
+
+        seeds = []
+
+        for source_key in self._planned:
+            if source_key == key:
+                continue
+            if source_key.camera != key.camera:
+                continue
+            if source_key.filter is None:
+                continue
+
+            record = self._current_twilight_record(self.cameras[source_key], now)
+            if record is not None:
+                seeds.append((record.timestamp, source_key, record))
+
+        if seeds:
+            _, source_key, record = max(seeds, key=lambda item: item[0])
+            estimate = (record.exposure_time * throughput[source_key.filter] / throughput[key.filter])
+
+        else:
+            estimate = (self.initial_exposure / throughput[key.filter])
+
+        return self._clip_exposure(estimate)
 
     def _planned_request(self, task_id: str) -> ObservationRequest:
         """One request with its own pinned exposure for every incomplete planned pair.
