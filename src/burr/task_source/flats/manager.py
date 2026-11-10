@@ -371,6 +371,51 @@ class FlatFieldManager:
             if self.cameras[key].good_frames < self.target_for(key)
         ]
 
+    def _ordered_remaining_pairs(self, now: datetime) -> list[FlatSequenceKey]:
+        """Return incomplete planned pairs in the correct twilight filter order.
+
+        Without a throughput table, preserve existing plan order.
+
+        With a table, reorder filters independently for each camera:
+        - dusk: lowest throughput first
+        - dawn: highest throughput first
+
+        Camera positions in the overall plan are preserved. Python's stable
+        sort preserves plan order for filters with equal throughput.
+        """
+        pairs = self.remaining_pairs()
+
+        if self.plan is None or self.plan.filter_throughput is None:
+            return pairs
+
+        throughput = self.plan.filter_throughput
+        dawn = self._is_dawn(now)
+
+        def pair_throughput(key: FlatSequenceKey) -> float:
+            # Planned SensorKit pairs must always identify a filter.
+            if key.filter is None:
+                raise ValueError(f"planned flat pair {key.label()} has no filter")
+            return throughput[key.filter]
+
+        ordered = list(pairs)
+
+        camera_order = list(dict.fromkeys(key.camera for key in pairs))
+        for camera in camera_order:
+            positions = [
+                index for index, key in enumerate(pairs) if key.camera == camera
+            ]
+            camera_pairs = [pairs[index] for index in positions]
+            camera_pairs = sorted(
+                camera_pairs,
+                key=pair_throughput,
+                reverse=dawn,
+            )
+
+            for position, key in zip(positions, camera_pairs, strict=True):
+                ordered[position] = key
+
+        return ordered
+
     def progress_summary(self) -> str:
         """``C0/Lum=3/10, C1/Lum=0/10`` for planned pairs, or seen sequences without a plan."""
         keys = list(self._planned) if self.plan else sorted(self.cameras)
@@ -413,24 +458,32 @@ class FlatFieldManager:
             midnight = midnight.replace(tzinfo=ZoneInfo("UTC"))
         return when >= midnight
 
-    def _next_exposure_for(self, last_exposure: float, average_counts: float, taken_at: datetime) -> float:
-        """Exposure that should hit ``target_counts`` now, given the last frame.
+    def _next_exposure_for(
+        self,
+        last_exposure: float,
+        average_counts: float,
+        taken_at: datetime,
+        *,
+        now: datetime | None = None,
+    ) -> float:
+        """Exposure that should hit ``target_counts`` at ``now``.
 
-        Scales the last exposure to the count target, then compensates for
-        the sky changing since that frame by ``2 ** (elapsed / doubling)``
-        (longer at dusk as it darkens, shorter at dawn as it brightens).
-        A frame from the other twilight (last evening's, seen at dawn) says
-        nothing about the sky now, so the sequence restarts at the minimum.
+        Scale the previous exposure to the target counts, then compensate for
+        sky brightening or darkening since the frame was taken. If ``now`` is
+        omitted, use the current UTC time.
         """
-        now = datetime.now(ZoneInfo("UTC"))
+        if now is None:
+            now = datetime.now(ZoneInfo("UTC"))
         dawn = self._is_dawn(now)
+
         if dawn != self._is_dawn(taken_at):
             return self.minimum_exposure
+
         exposure = last_exposure * (self.target_counts / max(average_counts, 1.0))
         elapsed = max((now - taken_at).total_seconds(), 0.0)
-        # Cap the doublings so a long gap clips to the limits instead of overflowing.
         sky_factor = 2.0 ** min(elapsed / self.sky_doubling_seconds, 64.0)
         exposure = exposure / sky_factor if dawn else exposure * sky_factor
+
         return float(np.clip(exposure, self.minimum_exposure, self.maximum_exposure))
 
     def _shared_exposure(self) -> float:
@@ -850,14 +903,20 @@ class FlatFieldManager:
 
         return request
 
-    def _pair_exposure(self, key: FlatSequenceKey) -> float:
-        """This pair's ideal exposure now: its last frame re-projected, else the minimum."""
+    def _pair_exposure(
+        self, key: FlatSequenceKey, *, now: datetime | None = None
+    ) -> float:
+        """Return this pair's ideal exposure at ``now``."""
         state = self.cameras[key]
         if not state.exposures:
             return self.minimum_exposure
+
         last = state.exposures[-1]
         return self._next_exposure_for(
-            last.exposure_time, last.median_counts, last.timestamp
+            last.exposure_time,
+            last.median_counts,
+            last.timestamp,
+            now=now,
         )
 
     def _planned_request(self, task_id: str) -> ObservationRequest:
@@ -869,18 +928,23 @@ class FlatFieldManager:
         ``CameraParameterSet``. ``exposure_seconds`` holds the shortest, only
         to keep the request well formed.
         """
+        now = datetime.now(ZoneInfo("UTC"))
+        ordered_pairs = self._ordered_remaining_pairs(now)
+
         entries = [
             {
                 "camera": key.camera,
                 "instrument": self._planned[key].instrument,
                 "filter": key.filter,
-                "exposure_seconds": self._pair_exposure(key),
+                "exposure_seconds": self._pair_exposure(key, now=now),
                 "request_id": str(uuidlib.uuid4()),
             }
-            for key in self.remaining_pairs()
+            for key in ordered_pairs
         ]
-        self._request_started_at = datetime.now(ZoneInfo("UTC"))
-        self.current_exposure = min(entry["exposure_seconds"] for entry in entries)
+        self._request_started_at = now
+        self.current_exposure = min(
+            entry["exposure_seconds"] for entry in entries
+        )
         request = ObservationRequest(
             task_id=task_id,
             source_name="twilight_flats",
@@ -890,13 +954,16 @@ class FlatFieldManager:
             rates=None,
             metadata={"flat_plan": entries},
         )
+        twilight = "dawn" if self._is_dawn(now) else "dusk"
         logger.info(
-            f"Generated planned flat request {task_id} for {len(entries)} pair(s):"
+            f"Generated planned flat request {task_id} for "
+            f"{len(entries)} pair(s), ordered for {twilight}:"
         )
         for entry in entries:
             key = FlatSequenceKey(entry["camera"], entry["filter"])
             logger.info(
-                f"├── {key.label()} on {entry['instrument']}: {entry['exposure_seconds']:.3f}s "
+                f"├── {key.label()} on {entry['instrument']}: "
+                f"{entry['exposure_seconds']:.3f}s "
                 f"({self.cameras[key].good_frames}/{self.target_for(key)})"
             )
         logger.info("└── Pointing: Alt=75.0, Az=0.0, tracking OFF")
