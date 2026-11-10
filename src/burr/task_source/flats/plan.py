@@ -15,6 +15,8 @@ See ``docs/flats.md`` for the planning and matching rules.
 
 from __future__ import annotations
 
+import math
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from burr.task_source.flats.products import (
@@ -81,12 +83,50 @@ class FlatPlanConfig(BaseModel):
     pairs: list[FlatPairPlan] = Field(
         description="Every camera/filter pair that needs flats"
     )
+    filter_throughput: dict[str, float] | None = Field(
+        default=None,
+        description=(
+            "Relative counts per second for each planned filter. Every planned "
+            "filter must be listed, or the table must be omitted."
+        ),
+    )
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    @field_validator("filter_throughput")
+    @classmethod
+    def _valid_filter_throughput(
+        cls, table: dict[str, float] | None
+    ) -> dict[str, float] | None:
+        """Require safe filter names and finite, positive throughputs."""
+        if table is None:
+            return None
+        if not table:
+            raise ValueError(
+                "filter_throughput cannot be empty; omit it to use plan order"
+            )
+
+        for filter_name, throughput in table.items():
+            if filter_name != filter_name.strip():
+                raise ValueError(
+                    f"filter_throughput name {filter_name!r} has leading or "
+                    "trailing whitespace"
+                )
+            try:
+                validate_component("filter", filter_name)
+            except UnsafeIdentityError as e:
+                raise ValueError(str(e)) from e
+
+            if not math.isfinite(throughput) or throughput <= 0:
+                raise ValueError(
+                    f"filter_throughput for {filter_name!r} must be finite and "
+                    f"greater than zero, got {throughput!r}"
+                )
+        return table
+
     @model_validator(mode="after")
     def _consistent(self) -> FlatPlanConfig:
-        """Reject an empty plan, duplicate pairs and conflicting camera/instrument mappings."""
+        """Reject incomplete, duplicate or inconsistent plans."""
         if not self.pairs:
             raise ValueError("a flat plan needs at least one camera/filter pair")
         seen: dict[tuple[str, str], FlatPairPlan] = {}
@@ -104,6 +144,27 @@ class FlatPlanConfig(BaseModel):
                 instruments, pair.instrument, pair.camera, "instrument", "camera"
             )
             _same_mapping(cameras, pair.camera, pair.instrument, "camera", "instrument")
+
+        if self.filter_throughput is not None:
+            planned_filters = {pair.filter for pair in self.pairs}
+            configured_filters = set(self.filter_throughput)
+            missing = sorted(planned_filters - configured_filters)
+            extra = sorted(configured_filters - planned_filters)
+
+            if missing or extra:
+                details = []
+                if missing:
+                    details.append(
+                        "missing planned filter(s): " + ", ".join(missing)
+                    )
+                if extra:
+                    details.append(
+                        "unplanned filter(s): " + ", ".join(extra)
+                    )
+                raise ValueError(
+                    "filter_throughput must list every planned filter exactly; "
+                    + "; ".join(details)
+                )
         return self
 
     def target(self, pair: FlatPairPlan) -> int:

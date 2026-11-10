@@ -34,6 +34,105 @@ def test_a_valid_plan_with_defaults_and_overrides():
         ("C0/Lum", 10),
         ("C1/Lum", 4),
     ]
+    assert plan.filter_throughput is None
+
+
+def test_filter_throughput_covers_unique_planned_filters():
+    plan = FlatPlanConfig(
+        pairs=[
+            _pair("C0", "Lum"),
+            _pair("C1", "Lum"),
+            _pair("C0", "g"),
+            _pair("C0", "r"),
+        ],
+        filter_throughput={"Lum": 1.0, "g": 0.69, "r": 0.21},
+    )
+
+    assert plan.filter_throughput == {"Lum": 1.0, "g": 0.69, "r": 0.21}
+
+
+def test_filter_throughput_may_be_above_one():
+    plan = FlatPlanConfig(
+        pairs=[_pair("C0", "Clear")],
+        filter_throughput={"Clear": 1.4},
+    )
+
+    assert plan.filter_throughput == {"Clear": 1.4}
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        pytest.param(0.0, "greater than zero", id="zero"),
+        pytest.param(-0.1, "greater than zero", id="negative"),
+        pytest.param(float("nan"), "finite", id="nan"),
+        pytest.param(float("inf"), "finite", id="positive-infinity"),
+        pytest.param(float("-inf"), "finite", id="negative-infinity"),
+    ],
+)
+def test_filter_throughput_must_be_positive_and_finite(value, message):
+    with pytest.raises(ValidationError, match=message):
+        FlatPlanConfig(
+            pairs=[_pair("C0", "Lum")],
+            filter_throughput={"Lum": value},
+        )
+
+
+def test_filter_throughput_rejects_missing_planned_filter():
+    with pytest.raises(ValidationError, match=r"missing planned filter\(s\): r"):
+        FlatPlanConfig(
+            pairs=[_pair("C0", "Lum"), _pair("C0", "r")],
+            filter_throughput={"Lum": 1.0},
+        )
+
+
+def test_filter_throughput_rejects_unplanned_filter():
+    with pytest.raises(ValidationError, match=r"unplanned filter\(s\): r"):
+        FlatPlanConfig(
+            pairs=[_pair("C0", "Lum")],
+            filter_throughput={"Lum": 1.0, "r": 0.21},
+        )
+
+
+def test_filter_throughput_names_are_case_sensitive():
+    with pytest.raises(ValidationError, match=r"missing planned filter\(s\): Lum"):
+        FlatPlanConfig(
+            pairs=[_pair("C0", "Lum")],
+            filter_throughput={"lum": 1.0},
+        )
+
+
+def test_filter_throughput_rejects_empty_table():
+    with pytest.raises(ValidationError, match="cannot be empty"):
+        FlatPlanConfig(
+            pairs=[_pair("C0", "Lum")],
+            filter_throughput={},
+        )
+
+
+@pytest.mark.parametrize("name", [" Lum", "r/g", "g_r"])
+def test_filter_throughput_rejects_unsafe_names(name):
+    with pytest.raises(ValidationError):
+        FlatPlanConfig(
+            pairs=[_pair("C0", "Lum")],
+            filter_throughput={"Lum": 1.0, name: 0.5},
+        )
+
+
+def test_twilight_config_accepts_filter_throughput():
+    config = TwilightFlatsConfig(
+        plan={
+            "frames_per_pair": 10,
+            "filter_throughput": {"Lum": 1.0, "g": 0.69, "r": 0.21},
+            "pairs": [
+                _pair("C0", "Lum"),
+                _pair("C0", "g"),
+                _pair("C0", "r"),
+            ],
+        }
+    )
+
+    assert config.plan.filter_throughput["r"] == 0.21
 
 
 @pytest.mark.parametrize(
