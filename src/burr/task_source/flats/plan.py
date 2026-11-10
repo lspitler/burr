@@ -16,6 +16,7 @@ See ``docs/flats.md`` for the planning and matching rules.
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -91,7 +92,27 @@ class FlatPlanConfig(BaseModel):
         ),
     )
 
+    filter_sequencing: Literal["batched", "per_filter"] = Field(
+        default="batched",
+        description=(
+            "batched: each request takes every incomplete filter on each camera, back "
+            "to back. per_filter: each camera works one filter at a time (a phase), "
+            "all cameras concurrently, one exposure per camera per request; filters "
+            "ordered by filter_wavelength_nm (dusk red to blue, dawn blue to red)"
+        ),
+    )
+    filter_wavelength_nm: dict[str, float] | None = Field(
+        default=None,
+        description="Effective wavelength per planned filter (nm); required for per_filter",
+    )
+
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+    @field_validator("filter_wavelength_nm")
+    @classmethod
+    def _valid_filter_wavelength(cls, table: dict[str, float] | None) -> dict[str, float] | None:
+        """Same rules as filter_throughput: safe names, finite positive values."""
+        return cls._valid_filter_throughput(table)
 
     @field_validator("filter_throughput")
     @classmethod
@@ -146,7 +167,11 @@ class FlatPlanConfig(BaseModel):
             _same_mapping(cameras, pair.camera, pair.instrument, "camera", "instrument")
 
         if self.filter_throughput is not None:
-            _check_throughput_covers_plan(self.filter_throughput, self.pairs)
+            _check_throughput_covers_plan(self.filter_throughput, self.pairs, "filter_throughput")
+        if self.filter_wavelength_nm is not None:
+            _check_throughput_covers_plan(self.filter_wavelength_nm, self.pairs, "filter_wavelength_nm")
+        if self.filter_sequencing == "per_filter" and self.filter_wavelength_nm is None:
+            raise ValueError("filter_sequencing: per_filter needs filter_wavelength_nm to order the filters")
         return self
 
     def target(self, pair: FlatPairPlan) -> int:
@@ -157,8 +182,10 @@ class FlatPlanConfig(BaseModel):
         return {pair.key: pair for pair in self.pairs}
 
 
-def _check_throughput_covers_plan(table: dict[str, float], pairs: list[FlatPairPlan]) -> None:
-    """``filter_throughput`` must list every planned filter, and only planned filters."""
+def _check_throughput_covers_plan(
+    table: dict[str, float], pairs: list[FlatPairPlan], name: str = "filter_throughput"
+) -> None:
+    """A per-filter table must list every planned filter, and only planned filters."""
     planned_filters = {pair.filter for pair in pairs}
     configured_filters = set(table)
     missing = sorted(planned_filters - configured_filters)
@@ -170,7 +197,7 @@ def _check_throughput_covers_plan(table: dict[str, float], pairs: list[FlatPairP
         details.append("missing planned filter(s): " + ", ".join(missing))
     if extra:
         details.append("unplanned filter(s): " + ", ".join(extra))
-    raise ValueError("filter_throughput must list every planned filter exactly; " + "; ".join(details))
+    raise ValueError(f"{name} must list every planned filter exactly; " + "; ".join(details))
 
 
 def _same_mapping(

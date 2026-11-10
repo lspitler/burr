@@ -375,6 +375,43 @@ class FlatFieldManager:
             if self.cameras[key].good_frames < self.target_for(key)
         ]
 
+    def _phase_exhausted(self, key: FlatSequenceKey, now: datetime) -> bool:
+        """True if ``key`` can no longer produce a good frame this twilight.
+
+        Dusk only darkens: a frame already at the maximum exposure that came
+        out below ``min_counts`` can't recover. Dawn only brightens: a frame at
+        the minimum exposure above ``max_counts`` can't recover. Judged on
+        this twilight's newest record only (see ``_current_twilight_record``).
+        """
+        record = self._current_twilight_record(self.cameras[key], now)
+        if record is None:
+            return False
+        if self._is_dawn(now):
+            return record.exposure_time <= self.minimum_exposure * 1.001 and record.median_counts > self.max_counts
+        return record.exposure_time >= self.maximum_exposure * 0.999 and record.median_counts < self.min_counts
+
+    def _filter_phase_pairs(self, now: datetime) -> list[FlatSequenceKey]:
+        """``per_filter`` sequencing: each camera's current filter, one pair per camera.
+
+        A camera's filters are taken one at a time in wavelength order: dusk
+        from red to blue, dawn from blue to red. A camera moves to its next
+        filter once the current one is complete or exhausted for this
+        twilight. All cameras run concurrently, each on its own phase, so a
+        filter only one camera has never holds the others up.
+        """
+        wavelength = self.plan.filter_wavelength_nm
+        dawn = self._is_dawn(now)
+        by_camera: dict[str, list[FlatSequenceKey]] = {}
+        for key in self.remaining_pairs():
+            by_camera.setdefault(key.camera, []).append(key)
+        phase = []
+        for keys in by_camera.values():
+            ordered = sorted(keys, key=lambda k: wavelength[k.filter], reverse=not dawn)
+            current = next((k for k in ordered if not self._phase_exhausted(k, now)), None)
+            if current is not None:
+                phase.append(current)
+        return phase
+
     def _ordered_remaining_pairs(self, now: datetime) -> list[FlatSequenceKey]:
         """Return incomplete planned pairs in the correct twilight filter order.
 
@@ -1011,7 +1048,7 @@ class FlatFieldManager:
 
         return self._clip_exposure(estimate)
 
-    def _planned_request(self, task_id: str) -> ObservationRequest:
+    def _planned_request(self, task_id: str) -> ObservationRequest | None:
         """One request with its own pinned exposure for every incomplete planned pair.
 
         ``metadata["flat_plan"]`` lists, per pair, the camera, the SensorKit
@@ -1021,7 +1058,13 @@ class FlatFieldManager:
         to keep the request well formed.
         """
         now = datetime.now(ZoneInfo("UTC"))
-        ordered_pairs = self._ordered_remaining_pairs(now)
+        if self.plan.filter_sequencing == "per_filter":
+            ordered_pairs = self._filter_phase_pairs(now)
+            if not ordered_pairs:
+                logger.info("Every remaining flat pair is exhausted for this twilight; no request")
+                return None
+        else:
+            ordered_pairs = self._ordered_remaining_pairs(now)
 
         entries = [
             {
