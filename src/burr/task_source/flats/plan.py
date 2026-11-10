@@ -146,25 +146,7 @@ class FlatPlanConfig(BaseModel):
             _same_mapping(cameras, pair.camera, pair.instrument, "camera", "instrument")
 
         if self.filter_throughput is not None:
-            planned_filters = {pair.filter for pair in self.pairs}
-            configured_filters = set(self.filter_throughput)
-            missing = sorted(planned_filters - configured_filters)
-            extra = sorted(configured_filters - planned_filters)
-
-            if missing or extra:
-                details = []
-                if missing:
-                    details.append(
-                        "missing planned filter(s): " + ", ".join(missing)
-                    )
-                if extra:
-                    details.append(
-                        "unplanned filter(s): " + ", ".join(extra)
-                    )
-                raise ValueError(
-                    "filter_throughput must list every planned filter exactly; "
-                    + "; ".join(details)
-                )
+            _check_throughput_covers_plan(self.filter_throughput, self.pairs)
         return self
 
     def target(self, pair: FlatPairPlan) -> int:
@@ -173,6 +155,22 @@ class FlatPlanConfig(BaseModel):
 
     def by_key(self) -> dict[FlatSequenceKey, FlatPairPlan]:
         return {pair.key: pair for pair in self.pairs}
+
+
+def _check_throughput_covers_plan(table: dict[str, float], pairs: list[FlatPairPlan]) -> None:
+    """``filter_throughput`` must list every planned filter, and only planned filters."""
+    planned_filters = {pair.filter for pair in pairs}
+    configured_filters = set(table)
+    missing = sorted(planned_filters - configured_filters)
+    extra = sorted(configured_filters - planned_filters)
+    if not (missing or extra):
+        return
+    details = []
+    if missing:
+        details.append("missing planned filter(s): " + ", ".join(missing))
+    if extra:
+        details.append("unplanned filter(s): " + ", ".join(extra))
+    raise ValueError("filter_throughput must list every planned filter exactly; " + "; ".join(details))
 
 
 def _same_mapping(

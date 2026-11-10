@@ -222,3 +222,44 @@ def test_planless_first_request_uses_clipped_initial_exposure(tmp_path):
     request = manager.generate_request(task_id="planless")
 
     assert request.exposure_seconds == [2.0]
+
+
+def test_previous_nights_dusk_record_does_not_drive_tonights_exposure(tmp_path):
+    """A record from the same side of midnight but a different night is stale.
+
+    Exposure records live in memory, so if burr stays enabled across nights a
+    dusk frame from yesterday is still "a dusk frame" today; it must not set
+    tonight's exposure or seed tonight's other filters.
+    """
+    manager = _manager(
+        tmp_path,
+        pairs=[_pair("C0", "Lum"), _pair("C0", "r")],
+        throughput={"Lum": 1.0, "r": 0.2},
+    )
+    _add_record(
+        manager,
+        FlatSequenceKey("C0", "Lum"),
+        timestamp=NOW - timedelta(hours=24),
+        exposure=60.0,
+    )
+
+    # Neither the pair's own path nor seeding uses yesterday's frame: both cold-start.
+    assert manager._pair_exposure(FlatSequenceKey("C0", "Lum"), now=NOW) == pytest.approx(1.0)
+    assert manager._pair_exposure(FlatSequenceKey("C0", "r"), now=NOW) == pytest.approx(5.0)
+
+
+def test_recent_record_in_the_same_twilight_is_still_used(tmp_path):
+    """The staleness limit must not discard frames from this twilight."""
+    manager = _manager(
+        tmp_path,
+        pairs=[_pair("C0", "Lum"), _pair("C0", "r")],
+        throughput={"Lum": 1.0, "r": 0.2},
+    )
+    _add_record(
+        manager,
+        FlatSequenceKey("C0", "Lum"),
+        timestamp=NOW - timedelta(minutes=20),
+        exposure=2.0,
+    )
+
+    assert manager._pair_exposure(FlatSequenceKey("C0", "r"), now=NOW) == pytest.approx(10.0, rel=1e-6)

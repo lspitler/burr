@@ -124,6 +124,15 @@ class TwilightFlatsConfig(BaseModel):
     collect: bool = Field(default=True, description="Whether to collect flats")
     n_frames: int = Field(default=20, description="Number of frames to collect")
     initial_exposure_seconds: float = Field(default=1.0, gt=0, description="Reference-filter exposure used before any current-twilight measurement" )
+    twilight_record_max_age_seconds: float = Field(
+        default=7200.0,
+        gt=0,
+        description=(
+            "A measurement only counts as this twilight's if it is on the same side of midnight "
+            "AND at most this old. One twilight lasts ~30 min and the same twilight next night is "
+            "24 h later, so anything well under 12 h separates nights"
+        ),
+    )
     minimum_exposure_seconds: float = Field(default=0.1, description="Minimum exposure time in seconds")
     min_counts: int = Field(default=30000, description="Minimum ADU counts")
     max_counts: int = Field(default=50000, description="Maximum ADU counts")

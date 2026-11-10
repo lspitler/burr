@@ -270,6 +270,7 @@ class FlatFieldManager:
         self.target_counts = (self.min_counts + self.max_counts) / 2
         self.minimum_exposure = self.config.minimum_exposure_seconds
         self.initial_exposure = self.config.initial_exposure_seconds
+        self.twilight_record_max_age = self.config.twilight_record_max_age_seconds
         self.maximum_exposure = self.config.maximum_exposure_seconds
         self.sky_doubling_seconds = self.config.sky_doubling_seconds
         self.cutout_size = self.config.cutout_size
@@ -920,12 +921,19 @@ class FlatFieldManager:
         state: FlatSequenceState,
         now: datetime,
     ) -> ExposureRecord | None:
-        """Return the newest record from the same dusk/dawn as ``now``."""
+        """Return the newest record from the same twilight as ``now``.
+
+        Same twilight means the same side of local midnight (dusk vs dawn)
+        and taken at most ``twilight_record_max_age_seconds`` before ``now``.
+        The age limit matters when burr stays enabled across nights: last
+        night's dusk frames are still "dusk", but say nothing about tonight.
+        """
         dawn = self._is_dawn(now)
+        oldest = now - timedelta(seconds=self.twilight_record_max_age)
         candidates = [
             record
             for record in state.exposures
-            if self._is_dawn(record.timestamp) == dawn
+            if self._is_dawn(record.timestamp) == dawn and oldest <= record.timestamp <= now
         ]
 
         return max(
@@ -933,6 +941,22 @@ class FlatFieldManager:
             key=lambda record: record.timestamp,
             default=None,
         )
+
+    def _newest_same_camera_seed(
+        self, key: FlatSequenceKey, now: datetime
+    ) -> tuple[FlatSequenceKey, ExposureRecord] | None:
+        """Newest this-twilight measurement of another planned filter on ``key``'s camera."""
+        seeds = []
+        for source_key in self._planned:
+            if source_key == key or source_key.camera != key.camera or source_key.filter is None:
+                continue
+            record = self._current_twilight_record(self.cameras[source_key], now)
+            if record is not None:
+                seeds.append((record.timestamp, source_key, record))
+        if not seeds:
+            return None
+        _, source_key, record = max(seeds, key=lambda item: item[0])
+        return source_key, record
 
     def _pair_exposure(
         self, key: FlatSequenceKey, *, now: datetime | None = None
@@ -964,22 +988,9 @@ class FlatFieldManager:
         if key.filter is None:
             raise ValueError(f"planned flat pair {key.label()} has no filter")
 
-        seeds = []
-
-        for source_key in self._planned:
-            if source_key == key:
-                continue
-            if source_key.camera != key.camera:
-                continue
-            if source_key.filter is None:
-                continue
-
-            record = self._current_twilight_record(self.cameras[source_key], now)
-            if record is not None:
-                seeds.append((record.timestamp, source_key, record))
-
-        if seeds:
-            _, source_key, record = max(seeds, key=lambda item: item[0])
+        seed = self._newest_same_camera_seed(key, now)
+        if seed is not None:
+            source_key, record = seed
             estimate = (record.exposure_time * throughput[source_key.filter] / throughput[key.filter])
 
         else:
