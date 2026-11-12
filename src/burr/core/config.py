@@ -143,6 +143,15 @@ class TwilightFlatsConfig(BaseModel):
             "24 h later, so anything well under 12 h separates nights"
         ),
     )
+    seed_min_counts: float = Field(
+        default=1000.0,
+        ge=0,
+        description=(
+            "A frame only seeds another filter's first exposure if its counts (raw ADU, bias "
+            "included, as burr measures them) are at least this. Below it the frame is at or "
+            "near bias and says nothing about the sky, so the reference/throughput estimate is used"
+        ),
+    )
     minimum_exposure_seconds: float = Field(default=0.1, description="Minimum exposure time in seconds")
     min_counts: int = Field(default=30000, description="Minimum ADU counts")
     max_counts: int = Field(default=50000, description="Maximum ADU counts")

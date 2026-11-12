@@ -114,8 +114,17 @@ def test_exhaustion_is_judged_on_this_twilight_only(tmp_path):
     assert ("C3", "z") in _phase(m)  # yesterday's failure doesn't skip z tonight
 
 
-def test_no_request_when_every_remaining_pair_is_exhausted(tmp_path):
+def test_no_request_when_every_remaining_pair_is_exhausted(tmp_path, monkeypatch):
     m = _manager(tmp_path, [_pair("C3", "z"), _pair("C3", "u")])
+    import burr.task_source.flats.manager as mod
+
+    class Fixed(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW if tz is None else NOW.astimezone(tz)
+
+    # _planned_request reads the clock; without pinning it, the records go stale 2 h after NOW.
+    monkeypatch.setattr(mod, "datetime", Fixed)
     for f in ("z", "u"):
         _record(m, FlatSequenceKey("C3", f), exposure=60.0, counts=500)
     assert m._filter_phase_pairs(NOW) == []

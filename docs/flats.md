@@ -391,6 +391,11 @@ blue. Don't build a colour assumption in; measure.)
    `t_new = t_measured × (throughput_measured / throughput_new)`. That saves
    the first rejected frames per filter, which is most of the cost in a
    ~30 min window.
+   A frame below `seed_min_counts` (default 1000 ADU raw, bias included) is
+   never used as a seed: at bias level it says nothing about the sky. On
+   11-11 dusk, C3's u at 60 s read ~bias and seeded z at
+   60 × 0.004 / 0.05 = 4.8 s; now z falls back to the reference/throughput
+   estimate.
 
 4. **`initial_exposure_seconds`** (new; default 1.0) replaces
    `minimum_exposure_seconds` as the first exposure. On 11-09 the 0.1 s

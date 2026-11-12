@@ -273,6 +273,7 @@ class FlatFieldManager:
         self.initial_exposure_dusk = self.config.initial_exposure_dusk_seconds or self.initial_exposure
         self.initial_exposure_dawn = self.config.initial_exposure_dawn_seconds or self.initial_exposure
         self.twilight_record_max_age = self.config.twilight_record_max_age_seconds
+        self.seed_min_counts = self.config.seed_min_counts
         self.maximum_exposure = self.config.maximum_exposure_seconds
         self.sky_doubling_seconds = self.config.sky_doubling_seconds
         self.cutout_size = self.config.cutout_size
@@ -998,13 +999,18 @@ class FlatFieldManager:
     def _newest_same_camera_seed(
         self, key: FlatSequenceKey, now: datetime
     ) -> tuple[FlatSequenceKey, ExposureRecord] | None:
-        """Newest this-twilight measurement of another planned filter on ``key``'s camera."""
+        """Newest this-twilight measurement of another planned filter on ``key``'s camera.
+
+        A filter whose newest frame is below ``seed_min_counts`` is skipped: a
+        frame at bias level (e.g. u at 60 s at dusk) carries no exposure
+        information, and scaling from it gives a meaningless start.
+        """
         seeds = []
         for source_key in self._planned:
             if source_key == key or source_key.camera != key.camera or source_key.filter is None:
                 continue
             record = self._current_twilight_record(self.cameras[source_key], now)
-            if record is not None:
+            if record is not None and record.median_counts >= self.seed_min_counts:
                 seeds.append((record.timestamp, source_key, record))
         if not seeds:
             return None
