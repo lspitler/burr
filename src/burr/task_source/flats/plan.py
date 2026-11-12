@@ -91,6 +91,14 @@ class FlatPlanConfig(BaseModel):
             "filter must be listed, or the table must be omitted."
         ),
     )
+    filter_throughput_dusk: dict[str, float] | None = Field(
+        default=None,
+        description="filter_throughput for dusk only (the dusk sky is bluer); falls back to filter_throughput",
+    )
+    filter_throughput_dawn: dict[str, float] | None = Field(
+        default=None,
+        description="filter_throughput for dawn only (the dawn sky is redder); falls back to filter_throughput",
+    )
 
     filter_sequencing: Literal["batched", "per_filter"] = Field(
         default="batched",
@@ -122,7 +130,7 @@ class FlatPlanConfig(BaseModel):
         """Same rules as filter_throughput: safe names, finite positive values."""
         return cls._valid_filter_throughput(table)
 
-    @field_validator("filter_throughput")
+    @field_validator("filter_throughput", "filter_throughput_dusk", "filter_throughput_dawn")
     @classmethod
     def _valid_filter_throughput(
         cls, table: dict[str, float] | None
@@ -132,7 +140,7 @@ class FlatPlanConfig(BaseModel):
             return None
         if not table:
             raise ValueError(
-                "filter_throughput cannot be empty; omit it to use plan order"
+                "a filter table cannot be empty; omit it to use plan order"
             )
 
         for filter_name, throughput in table.items():
@@ -174,15 +182,29 @@ class FlatPlanConfig(BaseModel):
             )
             _same_mapping(cameras, pair.camera, pair.instrument, "camera", "instrument")
 
-        if self.filter_throughput is not None:
-            _check_throughput_covers_plan(self.filter_throughput, self.pairs, "filter_throughput")
-        if self.filter_wavelength_nm is not None:
-            _check_throughput_covers_plan(self.filter_wavelength_nm, self.pairs, "filter_wavelength_nm")
+        for name in ("filter_throughput", "filter_throughput_dusk", "filter_throughput_dawn", "filter_wavelength_nm"):
+            if getattr(self, name) is not None:
+                _check_throughput_covers_plan(getattr(self, name), self.pairs, name)
         if self.filter_sequencing == "per_filter":
-            needed = "filter_wavelength_nm" if self.filter_phase_order == "wavelength" else "filter_throughput"
-            if getattr(self, needed) is None:
-                raise ValueError(f"filter_phase_order: {self.filter_phase_order} needs {needed} to order the filters")
+            self._check_phase_order_table()
         return self
+
+    def _check_phase_order_table(self) -> None:
+        """per_filter needs its ordering table, for both twilights when ordering by throughput."""
+        if self.filter_phase_order == "wavelength":
+            if self.filter_wavelength_nm is None:
+                raise ValueError("filter_phase_order: wavelength needs filter_wavelength_nm to order the filters")
+            return
+        if self.throughput_for(dawn=False) is None or self.throughput_for(dawn=True) is None:
+            raise ValueError(
+                "filter_phase_order: throughput needs filter_throughput, or both "
+                "filter_throughput_dusk and filter_throughput_dawn, to order the filters"
+            )
+
+    def throughput_for(self, *, dawn: bool) -> dict[str, float] | None:
+        """The throughput table for one twilight: its own table, else ``filter_throughput``."""
+        own = self.filter_throughput_dawn if dawn else self.filter_throughput_dusk
+        return own if own is not None else self.filter_throughput
 
     def target(self, pair: FlatPairPlan) -> int:
         """Accepted frames required for ``pair``."""

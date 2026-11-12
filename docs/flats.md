@@ -391,6 +391,12 @@ blue. Don't build a colour assumption in; measure.)
    `t_new = t_measured × (throughput_measured / throughput_new)`. That saves
    the first rejected frames per filter, which is most of the cost in a
    ~30 min window.
+   **Dusk and dawn tables.** The twilight sky's colour differs (dawn is much
+   redder: r/g 0.27 at dusk, 0.45 at dawn), so the plan takes optional
+   `filter_throughput_dusk` and `filter_throughput_dawn`. Each falls back to
+   `filter_throughput`; the table for the current twilight drives ordering,
+   the starting exposure and seeding. With `per_filter` +
+   `filter_phase_order: throughput`, each twilight must resolve to a table.
    A frame below `seed_min_counts` (default 1000 ADU raw, bias included) is
    never used as a seed: at bias level it says nothing about the sky. On
    11-11 dusk, C3's u at 60 s read ~bias and seeded z at

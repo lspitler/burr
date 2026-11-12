@@ -403,7 +403,7 @@ class FlatFieldManager:
         """
         dawn = self._is_dawn(now)
         if self.plan.filter_phase_order == "throughput":
-            table, reverse = self.plan.filter_throughput, dawn  # dusk ascending (faint first), dawn bright first
+            table, reverse = self._throughput(now), dawn  # dusk ascending (faint first), dawn bright first
         else:
             table, reverse = self.plan.filter_wavelength_nm, not dawn  # dusk red first, dawn blue first
         by_camera: dict[str, list[FlatSequenceKey]] = {}
@@ -430,11 +430,10 @@ class FlatFieldManager:
         sort preserves plan order for filters with equal throughput.
         """
         pairs = self.remaining_pairs()
-
-        if self.plan is None or self.plan.filter_throughput is None:
+        throughput = self._throughput(now)
+        if throughput is None:
             return pairs
 
-        throughput = self.plan.filter_throughput
         dawn = self._is_dawn(now)
 
         def pair_throughput(key: FlatSequenceKey) -> float:
@@ -960,6 +959,12 @@ class FlatFieldManager:
         """
         return self.initial_exposure_dawn if self._is_dawn(now) else self.initial_exposure_dusk
 
+    def _throughput(self, now: datetime) -> dict[str, float] | None:
+        """This twilight's filter throughput table (dusk and dawn skies differ in colour)."""
+        if self.plan is None:
+            return None
+        return self.plan.throughput_for(dawn=self._is_dawn(now))
+
     def _clip_exposure(self, exposure: float) -> float:
         """Clip an exposure to the configured hardware limits."""
         return float(
@@ -1036,10 +1041,8 @@ class FlatFieldManager:
                 own_record.timestamp,
                 now=now,
             )
-        throughput = (self.plan.filter_throughput
-                      if self.plan is not None
-                      else None)
-        
+        throughput = self._throughput(now)
+
         # without relative filter data use reference start
         reference = self._initial_exposure(now)
         if throughput is None:
