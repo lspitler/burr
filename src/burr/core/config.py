@@ -143,6 +143,22 @@ class TwilightFlatsConfig(BaseModel):
             "24 h later, so anything well under 12 h separates nights"
         ),
     )
+    dawn_start_sun_altitude_deg: float | None = Field(
+        default=None,
+        ge=-18,
+        le=0,
+        description=(
+            "Dawn flats start only once the Sun has risen to this altitude (deg, e.g. -9.0). Earlier "
+            "dawn frames are too faint even at the maximum exposure. Clips the offered windows and "
+            "generate_request. None = the start of the configured windows"
+        ),
+    )
+    dusk_end_sun_altitude_deg: float | None = Field(
+        default=None,
+        ge=-18,
+        le=0,
+        description="Dusk flats stop once the Sun has set to this altitude (deg). None = the end of the configured windows",
+    )
     seed_min_counts: float = Field(
         default=1000.0,
         ge=0,

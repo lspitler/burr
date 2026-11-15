@@ -266,6 +266,21 @@ Direct (ASCOM) mode keeps its existing behaviour:
 - Direct mode has no source-file duplicate check: the executor reuses one
   temporary path per exposure, and its frames carry no task UUID.
 
+### Dawn start and dusk end by Sun altitude
+
+`dawn_start_sun_altitude_deg` (e.g. `-9.0`) opens the dawn flats window only
+once the Sun has risen to that altitude; `dusk_end_sun_altitude_deg` closes
+the dusk window when it sets to it. Both are optional (default: the full
+configured `windows`). On 11-16 dawn, 81 of 83 rejected frames came before
+Sun ~-9 deg: the first frames start at the 60 s cap and are still too faint.
+
+The limit clips the source's `offer_windows()`, which `Scheduler.offer_windows`
+merges for SensorKit, so SensorKit hands those minutes to other programs (a
+burr that merely declines to generate keeps the controller and idles).
+`generate_request` also returns None outside the clipped window as a safety
+net. SensorKit's own burr module (`modules/burr`, `_offer_intervals`) must call
+`scheduler.offer_windows` for the offer to be clipped there too.
+
 ## Pilot checklist
 
 Planned collection is tested end to end against SensorKit's real planner

@@ -112,9 +112,9 @@ def _required_conditions() -> set[LightingCondition]:
 
 
 def _offer_intervals() -> list[tuple[datetime, datetime]]:
-    """Merged offer windows for the currently registered sources."""
+    """Merged offer windows for the currently registered sources (clipped where a source clips)."""
     assert _ctx is not None
-    return _ctx.run.lighting_schedule.merged_windows_for(_required_conditions())
+    return _ctx.scheduler.offer_windows(_ctx.run.lighting_schedule)
 
 
 async def _on_attach() -> None:

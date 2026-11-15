@@ -274,6 +274,7 @@ class FlatFieldManager:
         self.initial_exposure_dawn = self.config.initial_exposure_dawn_seconds or self.initial_exposure
         self.twilight_record_max_age = self.config.twilight_record_max_age_seconds
         self.seed_min_counts = self.config.seed_min_counts
+        self._offer_windows: list[tuple[datetime, datetime]] | None = None
         self.maximum_exposure = self.config.maximum_exposure_seconds
         self.sky_doubling_seconds = self.config.sky_doubling_seconds
         self.cutout_size = self.config.cutout_size
@@ -347,6 +348,34 @@ class FlatFieldManager:
             LightingCondition(window.lower())
             for window in self.config.windows
         ]
+
+    def offer_windows(self) -> list[tuple[datetime, datetime]]:
+        """This source's windows, clipped by the dawn-start / dusk-end Sun altitudes.
+
+        Without either limit it is just the configured lighting windows. With
+        them, a dawn window opens no earlier than the Sun reaching
+        ``dawn_start_sun_altitude_deg`` and a dusk window closes no later than
+        the Sun setting to ``dusk_end_sun_altitude_deg``. SensorKit offers
+        these windows, so the minutes cut off go to other programs instead of
+        an idle Burr.
+        """
+        if self._offer_windows is None:
+            schedule = self.run.lighting_schedule
+            windows = schedule.merged_windows_for(self.suitable_conditions)
+            self._offer_windows = clip_windows_by_sun_altitude(
+                windows,
+                schedule.local_midnight,
+                self.run.config.site,
+                dawn_start=self.config.dawn_start_sun_altitude_deg,
+                dusk_end=self.config.dusk_end_sun_altitude_deg,
+            )
+        return self._offer_windows
+
+    def _outside_sun_limits(self, now: datetime) -> bool:
+        """True if a Sun-altitude limit is set and ``now`` is outside the clipped windows."""
+        if self.config.dawn_start_sun_altitude_deg is None and self.config.dusk_end_sun_altitude_deg is None:
+            return False
+        return not any(start <= now <= end for start, end in self.offer_windows())
 
     @property
     def good_frames(self) -> int:
@@ -936,6 +965,10 @@ class FlatFieldManager:
             )
             return None
 
+        if self._outside_sun_limits(datetime.now(ZoneInfo("UTC"))):
+            logger.info("Sun outside the configured dawn-start / dusk-end altitude; no flat request")
+            return None
+
         if self.plan is not None:
             return self._planned_request(task_id)
 
@@ -1486,3 +1519,51 @@ class FlatFieldManager:
         saturation_percentage = (saturated_pixels / total_pixels) * 100.0
 
         return saturation_percentage, threshold
+
+
+def _sun_altitudes(site, start: datetime, end: datetime, step_seconds: float = 10.0):
+    """Sun altitude (deg) sampled every ``step_seconds`` over ``[start, end]``: (times, altitudes)."""
+    from astropy.coordinates import AltAz, EarthLocation, get_sun
+    from astropy.time import Time
+    import astropy.units as u
+
+    location = EarthLocation(
+        lat=site.latitude * u.deg, lon=site.longitude * u.deg, height=(site.altitude_km or 0) * u.km
+    )
+    span = max((end - start).total_seconds(), 0.0)
+    times = Time(start) + np.linspace(0, span, max(int(span // step_seconds), 1) + 1) * u.s
+    return times, get_sun(times).transform_to(AltAz(obstime=times, location=location)).alt.deg
+
+
+def clip_windows_by_sun_altitude(
+    windows: list[tuple[datetime, datetime]],
+    local_midnight: datetime,
+    site,
+    *,
+    dawn_start: float | None,
+    dusk_end: float | None,
+) -> list[tuple[datetime, datetime]]:
+    """Keep only the part of each window with the Sun above its limit.
+
+    Dawn windows (starting after local midnight) use ``dawn_start``, dusk
+    windows ``dusk_end``; a window without a limit is kept whole. In both
+    twilights the usable part is where the Sun is at or above the limit, so
+    a dawn window opens when the Sun rises through it and a dusk window
+    closes when it sets through it. A window wholly below is dropped.
+    """
+    if local_midnight.tzinfo is None:
+        local_midnight = local_midnight.replace(tzinfo=ZoneInfo("UTC"))
+    clipped = []
+    for start, end in windows:
+        limit = dawn_start if start >= local_midnight else dusk_end
+        if limit is None:
+            clipped.append((start, end))
+            continue
+        times, alts = _sun_altitudes(site, start, end)
+        above = np.where(alts >= limit)[0]
+        if not len(above):
+            continue
+        first = start if above[0] == 0 else times[above[0]].to_datetime(timezone=ZoneInfo("UTC"))
+        last = end if above[-1] == len(alts) - 1 else times[above[-1]].to_datetime(timezone=ZoneInfo("UTC"))
+        clipped.append((first, last))
+    return clipped
