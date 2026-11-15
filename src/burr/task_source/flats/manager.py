@@ -469,6 +469,24 @@ class FlatFieldManager:
             for key in keys
         )
 
+    def progress_totals(self) -> str:
+        """One-line progress for logs.
+
+        With a plan: ``185/189 planned frames; behind: C3/u 0/3, C1/r 9/10``
+        (``n_frames`` doesn't apply, and ``good_frames`` is the minimum over
+        pairs, so neither alone says how far collection has got). Without a
+        plan: ``good/n_frames good frames``.
+        """
+        if not self.plan:
+            return f"{self.good_frames}/{self.target_flats} good frames"
+        counts = [(key, self.cameras[key].good_frames, self.target_for(key)) for key in self._planned]
+        done = sum(min(good, target) for _, good, target in counts)
+        total = sum(target for _, _, target in counts)
+        behind = [f"{key.label()} {good}/{target}" for key, good, target in counts if good < target]
+        return f"{done}/{total} planned frames; " + (
+            "behind: " + ", ".join(behind) if behind else "all pairs complete"
+        )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -1154,7 +1172,7 @@ class FlatFieldManager:
         """
         logger.info(
             f"Flat request {request.task_id} completed in {duration_seconds:.1f}s "
-            f"({self.good_frames}/{self.target_flats} good frames so far)"
+            f"({self.progress_totals()} so far)"
         )
 
         if self.sk_data_root is None:

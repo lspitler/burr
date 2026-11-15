@@ -192,3 +192,27 @@ def test_throughput_phase_order_needs_a_throughput_table():
     with pytest.raises(ValueError, match="needs filter_throughput"):
         TwilightFlatsConfig(plan={"pairs": [_pair("C0", "g")], "filter_sequencing": "per_filter",
                                   "filter_phase_order": "throughput"})
+
+
+def test_progress_totals_reports_planned_frames_and_pairs_behind(tmp_path):
+    """11-16 dawn logged "0/50 good frames so far" (min over pairs vs n_frames) all dawn."""
+    m = _manager(tmp_path, [_pair("C0", "g"), _pair("C0", "r"), _pair("C3", "u", frames=2)], frames_per_pair=3)
+    m.cameras[FlatSequenceKey("C0", "g")].good_frames = 3
+    m.cameras[FlatSequenceKey("C0", "r")].good_frames = 2
+    assert m.progress_totals() == "5/8 planned frames; behind: C0/r 2/3, C3/u 0/2"
+
+
+def test_progress_totals_when_complete_and_without_a_plan(tmp_path):
+    m = _manager(tmp_path, [_pair("C0", "g")], frames_per_pair=2)
+    m.cameras[FlatSequenceKey("C0", "g")].good_frames = 2
+    assert m.progress_totals() == "2/2 planned frames; all pairs complete"
+
+    config = TwilightFlatsConfig(n_frames=20)
+    run = SimpleNamespace(
+        config=SimpleNamespace(schedule=SimpleNamespace(twilight_flats=config)),
+        executed_commands=[],
+        output_directory=tmp_path / "planless",
+        lighting_schedule=SimpleNamespace(local_midnight=NOW + timedelta(hours=4)),
+        log_command=lambda *a, **k: None,
+    )
+    assert FlatFieldManager(run).progress_totals() == "0/20 good frames"
