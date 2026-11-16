@@ -4,7 +4,7 @@ CLI entrypoint for ``burr-sk``.
 Thin convenience wrapper around the sensorkit service entrypoint at
 ``burr.hardware.sk.burr_program:main``. Equivalent to running::
 
-    sensorkit service run burr burr.hardware.sk.burr_program:main
+    sensorkit service run Burr burr.hardware.sk.burr_program:main
 
 but with burr's ``--site``/``--preset``/``--config`` arg handling on top.
 Also hosts the ``--bootstrap`` interactive utility.
@@ -19,8 +19,6 @@ import sys
 from pathlib import Path
 
 from loguru import logger
-
-from burr.core.constants import LOCAL_APP_CONFIG_OVERRIDE
 
 
 def main() -> int:
@@ -41,7 +39,7 @@ def main() -> int:
         help="Mode preset YAML (scheduling balance, streaks, plotting). Deep-merged on top of --site.",
     )
     parser.add_argument(
-        "--name", "-n", default="burr",
+        "--name", "-n", default="Burr",
         help="Service name registered with SensorKit",
     )
     parser.add_argument(
@@ -74,9 +72,8 @@ def main() -> int:
         from burr.cli.sk_bootstrap import run_bootstrap
         return run_bootstrap(args.host, args.port, args.out)
 
-    # Resolve config paths: either --site + --preset (composed) or a
-    # single --config (legacy). If nothing is supplied, fall back to
-    # LOCAL_APP_CONFIG_OVERRIDE so behavior matches the old default.
+    # Explicit paths select standalone mode. Without paths, main() can
+    # load the unified SensorKit burr: section or retain the legacy fallback.
     paths: list[Path] = []
     if args.site or args.preset:
         if args.config:
@@ -86,13 +83,9 @@ def main() -> int:
         paths = [args.site, args.preset]
     elif args.config:
         paths = [args.config]
-    else:
-        paths = [LOCAL_APP_CONFIG_OVERRIDE]
-
-    # On Windows ``:`` appears inside drive-letter paths, so always use
-    # ``;`` there. _resolve_config_path() in burr_program handles both.
-    sep = ";" if os.name == "nt" else ":"
-    os.environ["BURR_CONFIG"] = sep.join(str(p) for p in paths)
+    if paths:
+        sep = ";" if os.name == "nt" else ":"
+        os.environ["BURR_CONFIG"] = sep.join(str(p) for p in paths)
 
     from sensorkit.api.entrypoint import ShutdownSignal, run_services
 

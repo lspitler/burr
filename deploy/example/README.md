@@ -26,6 +26,24 @@ burr-direct --site deploy/example/site.yaml --preset deploy/presets/survey.yaml
 burr-shutdown --site deploy/example/site.yaml --preset deploy/presets/sda.yaml
 ```
 
+## Unified SensorKit configuration
+
+For an existing SensorKit deployment, replace `sensorkit.burr.program` in
+`sensorkit.imports` with `burr.hardware.sk.burr_program`. Keep the existing
+`burr:` settings, including controller, runtime, schedule, `collect` camera
+settings and `raw_data_root`. The `burr:` section launches the service;
+do not also declare it under `services:`.
+
+For Huntsman, keep `id: Burr`, `controller: Huntsman` and the existing
+automation priorities and interrupt policy. Only one Burr entry is supported.
+The [planned-flat fragment](huntsman-flats-lum.yaml) shows the import and
+configuration shape; it is not a replacement for the tuned live plan.
+
+Leave `BURR_CONFIG` unset for unified configuration. Reload the deployment
+configuration before starting the service so its `BurrServiceConfig` model
+is uploaded. Explicit `--config` or `--site`/`--preset` arguments still
+select standalone configuration and launch the same program.
+
 ## Make your own
 
 1. Copy this directory: `cp -r deploy/example deploy/<your-site>`.

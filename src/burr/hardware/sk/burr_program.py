@@ -9,7 +9,7 @@ Launch modes:
   # Run directly through SensorKit:
   sensorkit service run Burr burr.hardware.sk.burr_program:main
 
-  # Or declare the service in SensorKit's unified configuration:
+  # Or declare a standalone service (BURR_CONFIG mode):
   services:
     - id: Burr
       python_module: burr.hardware.sk.burr_program
@@ -24,8 +24,14 @@ The program declaration is nameless, so it inherits the service name.
 Keep that name consistent with the program referenced by SensorKit's
 automation configuration. For Huntsman this should remain "Burr".
 
-When launching through SensorKit, BURR_CONFIG selects Burr's configuration
-file or composed site/preset files.
+A unified SensorKit burr: section launches this service automatically when
+sensorkit.imports contains burr.hardware.sk.burr_program. Do not also add
+an explicit services: entry for the same program. Reload configuration
+before starting so the BurrServiceConfig model is uploaded.
+
+BURR_CONFIG remains an explicit standalone override selecting Burr's
+configuration file or composed site/preset files. The examples below
+apply to that standalone mode.
 
 Linux:
   export BURR_CONFIG="deploy/example/site.yaml;deploy/presets/sda.yaml"
@@ -57,8 +63,14 @@ import sensorkit.api as sk
 from loguru import logger
 
 from burr.bootstrap import initialize_engine
-from burr.core.config import AppConfig, get_or_initialize_config
+from burr.core.config import (
+    AppConfig,
+    get_or_initialize_config,
+    initialize_config,
+    set_config,
+)
 from burr.core.logging import setup_loguru
+from burr.hardware.sk.service_config import BurrServiceConfig, service_config_for
 from burr.hardware.sk.settings import CollectConfig
 from burr.hardware.sk.tasks import build_requested_tasks
 from burr.models.observation import ObservationRequest
@@ -460,15 +472,59 @@ def _build_context(
     )
 
 
+async def _load_settings(
+    service: sk.Service,
+) -> tuple[AppConfig, CollectConfig]:
+    paths = _resolve_config_path()
+    if paths is not None:
+        config = await asyncio.to_thread(initialize_config, paths)
+        return config, CollectConfig()
+
+    try:
+        resolved = await sk.load_config(fail_policy="error")
+    except FileNotFoundError as exc:
+        default_file = Path("sensorkit.yaml").resolve()
+        missing = Path(exc.filename).resolve() if exc.filename else None
+        if "SENSORKIT_CONFIG" in os.environ or missing != default_file:
+            raise
+        config = await asyncio.to_thread(get_or_initialize_config)
+        return config, CollectConfig()
+
+    authored = service_config_for(resolved, service.name)
+    if authored is None:
+        config = await asyncio.to_thread(get_or_initialize_config)
+        return config, CollectConfig()
+
+    # Reuse this client when Service.register() registers the service later.
+    # Do not register the service before configuration/initialisation succeeds.
+    if service.client is None:
+        service.client = await sk.connect()
+
+    entity = service.client.entity(service.name)
+    try:
+        settings = await entity.kv_get_model(BurrServiceConfig)
+    except sk.KVError as exc:
+        raise RuntimeError(
+            f"No BurrServiceConfig is loaded for {service.name!r}. "
+            "Load the migrated SensorKit configuration before starting Burr."
+        ) from exc
+    if settings.id != service.name:
+        raise ValueError("Uploaded Burr configuration has the wrong program id")
+
+    config = await settings.to_app_config(service.client)
+    set_config(config)
+    return config, settings.collect
+
+
 @sk.service_entrypoint(version=sk.VERSION)
 async def main(service: sk.Service) -> None:
     global _ctx
 
     # Finish synchronous setup before registering program callbacks.
     await asyncio.to_thread(initialize_engine)
-    config = get_or_initialize_config(_resolve_config_path())
+    config, collect = await _load_settings(service)
     setup_loguru(level=config.logging.level)
-    _ctx = await asyncio.to_thread(_build_context, config)
+    _ctx = await asyncio.to_thread(_build_context, config, collect)
 
     declaration = sk.declare_program()
     sk.on_attach(declaration)(_on_attach)

@@ -1,19 +1,25 @@
 # Example: planned twilight flats, Lum filter, every Huntsman camera.
 #
-# This is the `burr:` section of a SensorKit deployment config, for SensorKit
-# mode only (`sensorkit go -c <config>`). It is an EXAMPLE: nothing loads this
-# file, and it does not change any live configuration. To use it, merge the
-# `twilight_flats` block into the `burr:` section of your SensorKit config,
-# after the supervised pilot in docs/flats.md ("Pilot checklist").
+# This is a fragment of a SensorKit deployment config, not a complete
+# deployment. Nothing loads it automatically. Merge the import into the
+# existing sensorkit.imports list, retaining other imports and replacing
+# sensorkit.burr.program. Keep the existing burr: entry, camera settings,
+# data paths, controller assignment and automation priorities.
 #
-# Requires a sensorkit with per-instrument CameraParameterSet support
-# (`instrument`/`request_id`) and the planned-flats burr module.
+# The burr: section creates the service; do not also add a services: entry
+# for Burr. Leave BURR_CONFIG unset in unified mode and reload configuration
+# before starting the service. Pilot checklist: docs/flats.md.
+# Requires native CameraParameterSet.instrument support; no request_id needed.
 #
 # camera     = the UNITID the camera's data graph writes into each frame
-# instrument = the SensorKit camera device key that takes that pair
+# instrument = the instrument name registered with the SensorKit controller
 # filter     = the filter name EXACTLY as that camera's wheel reports it.
 #              Wheel names are case-sensitive; "Lum" will not match "L" or
 #              "lum". Confirm each wheel's names before the pilot.
+sensorkit:
+  imports:
+    - burr.hardware.sk.burr_program
+
 burr:
   - id: Burr
     controller: Huntsman

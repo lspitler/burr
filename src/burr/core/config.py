@@ -438,6 +438,12 @@ class AppConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
 
+def set_config(config: AppConfig) -> None:
+    """Install an already validated configuration, such as one loaded from SensorKit."""
+    global _config_instance
+    _config_instance = config
+
+
 def get_config() -> AppConfig:
     """Get the global config instance.
 
@@ -464,8 +470,6 @@ def initialize_config(config_path: Path | list[Path]) -> AppConfig:
     Returns:
         AppConfig: Configuration instance
     """
-    global _config_instance
-
     paths = config_path if isinstance(config_path, list) else [config_path]
 
     if len(paths) == 1:
@@ -481,7 +485,7 @@ def initialize_config(config_path: Path | list[Path]) -> AppConfig:
         logger.error(f"Configuration validation failed: {e}")
         raise
 
-    _config_instance = config
+    set_config(config)
     return config
 
 
