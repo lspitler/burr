@@ -101,7 +101,12 @@ burr-direct --site deploy/example/site.yaml --preset deploy/presets/survey.yaml
 burr-sk --site deploy/example/site.yaml --preset deploy/presets/sda.yaml
 ```
 
-Runs as a SensorKit program/controller pair, integrating with the [SensorKit](https://github.com/sensorkit/sensorkit) agent framework for multi-system orchestration. Requires the `sk` extra. `burr-sk --bootstrap --host <agent>` discovers SK entities + site position from a running agent and emits a `site.yaml` fragment.
+Runs Burr's own program through [SensorKit](https://github.com/sensorkit/sensorkit),
+using SensorKit's configured sensor controller to execute observations. Requires
+the `sk` extra. For unified deployment configuration and migration from
+SensorKit's Burr module, see [the migration guide](docs/sensorkit-migration.md).
+`burr-sk --bootstrap --host <agent>` discovers SK entities + site position from
+a running agent and emits a `site.yaml` fragment.
 
 ### Safe shutdown
 

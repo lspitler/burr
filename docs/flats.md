@@ -278,29 +278,23 @@ The limit clips the source's `offer_windows()`, which `Scheduler.offer_windows`
 merges for SensorKit, so SensorKit hands those minutes to other programs (a
 burr that merely declines to generate keeps the controller and idles).
 `generate_request` also returns None outside the clipped window as a safety
-net. SensorKit's own burr module (`modules/burr`, `_offer_intervals`) must call
-`scheduler.offer_windows` for the offer to be clipped there too.
+net. Burr's own SensorKit program publishes `scheduler.offer_windows()`
+directly, so no SensorKit Burr-module patch is needed for clipping.
 
 ## Pilot checklist
 
-Planned collection is tested end to end against SensorKit's real planner
-with synthetic frames, but not yet on the telescope. Before relying on it,
-run a supervised pilot at twilight:
+Planned flats have worked on Huntsman through the previous adapter. The
+Burr-owned entry point needs its own supervised pilot after migration.
+See [the migration guide](sensorkit-migration.md) for deployment and validation.
 
-1. **Filter names.** Confirm each wheel reports a filter named exactly as in
-   the plan (e.g. `Lum`, not `L` or `lum`). A mismatch fails the whole
-   collect at planning time, which the log reports.
-2. **SensorKit build.** Run a SensorKit that has `CameraParameterSet.instrument`
-   and the planned-flats burr module, with this burr. A mismatched pair does
-   not misroute silently:
-   - **SensorKit core without `instrument`** would silently drop the field
-     and let the planner place every exposure anywhere. The burr module
-     checks for it and refuses to build a planned task, so the request
-     fails with "cannot pin an exposure to an instrument".
-   - **An older SensorKit burr module** ignores the plan and never reports
-     the task ID. Every planned request then logs "has no recorded SensorKit
-     task ID ... not counted" at error level, and nothing is counted.
-3. **Task ID in headers.** Check one frame from the pilot: `SKTASKID` must
+1. **Filter names.** Confirm each wheel reports the exact planned names.
+   A mismatch fails the collect at planning time.
+2. **Program and SensorKit build.** Use native instrument selection and
+   frame-type propagation with `burr.hardware.sk.burr_program`. Run one
+   Burr program. The stock SensorKit Burr module does not supply this
+   planned-flat adapter. No additional `request_id` field is required.
+3. **Task ID in headers.** Check the image HDU of a pilot frame. Its
+   `IMAGETYP` must be flat, and `SKTASKID` must
    equal the task ID in burr's "dispatched as SensorKit task" log line.
 4. **Concurrent exposures.** Confirm all planned cameras exposed in one
    collect, each with the exposure burr logged for it.
@@ -316,13 +310,12 @@ run a supervised pilot at twilight:
 
 These are known and left for later milestones:
 
-- **Without a plan**, behaviour is unchanged: each request uses one shared
-  exposure, SensorKit chooses a single camera for it, and completion covers
-  only pairs seen so far. Planned collection (above) resolves all three.
-- **Fixed filter order.** A camera with several planned filters takes all of
-  them in each request, one after another, in plan order (on 11-09: Lum, g,
-  then r on C0, C1 and C3). The order does not depend on the filters or on
-  whether it is dusk or dawn. See "Next change: filter-aware ordering".
+- **Without a plan**, the requested exposure is shared across the selected
+  instruments and completion covers only pairs seen so far. A plan supplies
+  independent exposures and explicit completion targets.
+- **Filter sequencing** supports batched or per-filter collection and
+  configured ordering. Throughput tables still need tuning to the site
+  and twilight; automatic learning is not implemented.
 - **No preflight filter check.** burr does not read the wheels' filter lists
   before requesting; an unavailable filter is discovered when SensorKit
   plans the collect, which fails the whole request.
@@ -332,16 +325,16 @@ These are known and left for later milestones:
   modification time and `IMAGETYP`; only planned collection matches by
   task ID.
 
-Recommended next milestones, in order: filter-aware ordering and starting
-exposures (below); a preflight that checks each planned wheel's reported
-filters, so an unavailable pair is skipped and reported before the request
-is sent instead of failing it.
+The next operational improvement is a preflight check of each planned
+wheel's reported filters, with an explicit policy for unavailable pairs.
 
-## Next change: filter-aware ordering and starting exposures
+## Filter-aware ordering and starting exposures: design notes
 
-**Status:** proposed, not implemented.
+**Status:** ordering, throughput scaling and separate dusk/dawn starting
+exposures are implemented. Automatic throughput learning remains future
+work. The following records the original motivation and design.
 
-### Problem
+### Original problem
 
 burr has no knowledge of a filter's bandwidth or wavelength:
 
@@ -372,7 +365,7 @@ last, in the darkest sky, the worst case for the faintest filter. (r is
 fainter than g here although sunset light is red; the post-sunset sky is
 blue. Don't build a colour assumption in; measure.)
 
-### Proposal
+### Design
 
 1. **Per-filter throughput in the plan.** A new optional mapping on
    `FlatPlanConfig`, relative to a reference filter:
@@ -427,14 +420,15 @@ blue. Don't build a colour assumption in; measure.)
    counts-per-second, so the `filter_throughput` table can be refreshed from
    data rather than estimated.
 
-### Tests to add
+### Validation cases
 
 - Dusk orders lowest-throughput first; dawn reverses it; no table keeps plan order.
 - First exposure per filter scales by throughput, within the min/max.
 - A measured pair seeds an unmeasured pair on the same camera.
 - Validation: a non-positive throughput, or a planned filter missing from a partial table, is rejected.
-- End to end (sensorkit `modules/burr/tests`): the planned task's parameter-set order per
-  instrument matches the throughput order, and pack keeps it.
+- Task translation (`tests/test_sk_task_builders.py`): planned parameters
+  preserve each instrument's filter order and exposure. Verify execution
+  order through SensorKit during the pilot.
 
 ### Non-goals
 

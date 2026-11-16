@@ -10,6 +10,8 @@
 # for Burr. Leave BURR_CONFIG unset in unified mode and reload configuration
 # before starting the service. Pilot checklist: docs/flats.md.
 # Requires native CameraParameterSet.instrument support; no request_id needed.
+# Migration and rollback: docs/sensorkit-migration.md. Keep the tuned live
+# camera/filter plan rather than replacing it with this Lum-only example.
 #
 # camera     = the UNITID the camera's data graph writes into each frame
 # instrument = the instrument name registered with the SensorKit controller
