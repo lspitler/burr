@@ -9,14 +9,17 @@ SK client needs to render the task lives in standard fields.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import uuid
+from collections.abc import Iterator
+from datetime import UTC, datetime, timezone
 
 import astropy.units as u
 import sensorkit.api as sk
 from astropy.coordinates import AltAz as AstropyAltAz, EarthLocation, SkyCoord
 from astropy.time import Time
 from pydantic import BaseModel
-from sensorkit.astro.common import Equatorial, Horizontal, ReferenceFrame, TLE
+from sensorkit.astro.common import ReferenceFrame, TLE
+from sensorkit.astro.coords import Equatorial, Horizontal
 from sensorkit.astro.target import (
     AltAzTarget as SKAltAzTarget,
     ICRSTarget,
@@ -24,49 +27,43 @@ from sensorkit.astro.target import (
     TLETarget as SKTLETarget,
     Target,
 )
+from sensorkit.data.filesys import FileNameTemplate
+from sensorkit.std.collect import CameraParameterSet, StandardCollectTask
+from sensorkit.std.instrument import FrameType
 
+from burr.core.config import AppConfig
+from burr.hardware.sk.settings import CameraSettings, CollectConfig
 from burr.models.observation import (
     AltAzTarget,
     LunarTarget,
+    ObservationRequest,
     RADecTarget,
     TargetUnion,
     TLETarget,
 )
+from burr.models.run import BurrRun
 from burr.models.site import SiteMetadata
-from burr.models.tracking import Rates
+from burr.models.tracking import Rates, TrackingMode
 
 
-@sk.declare_keyword
+@sk.declare_keyword(key="Burr")
 class BurrContext(BaseModel):
-    """Burr's identity keyword, attached to every SK collect task burr emits.
+    """Sequence identity carried in TaskSubmission.context under the Burr key.
 
-    Rides in ``StandardCollectTask.context`` as a *declared* keyword (rather
-    than loose flat keys), so it round-trips on the wire as a typed object and
-    is reachable from sensorkit FITS-header exprs and filename templates via
-    ``context.eval`` as ``BurrContext.<field>`` (e.g. ``BurrContext.seq``).
-    Being namespaced also stops these values from colliding with the generic
-    flat keys the std controller injects (``target_id``, ``track_mode``, ...),
-    which otherwise override anything burr puts at the top level.
-
-    Fields
-    ------
-    seq
-        Per-exposure collect id — a fresh value for each entry in the
-        request's ``exposure_seconds``. Every SK task and every frame fanned
-        out from one exposure (e.g. the sidereal reference frame plus its rate
-        frames) shares one ``seq``; distinct exposures differ. This is the unit
-        downstream fitting groups on ("I will fit this").
-    targ
-        Target name for this collect (filename-safe). The manager's best name
-        for the thing observed — star name, satellite name, coverage pixel, etc.
-    mode
-        The task source that produced the collect: ``coverage``, ``calsats``,
-        ``twilight_flats``, ``photometric_standards``, ``lunar_background``.
+    Split tracking tasks from one exposure share seq; each exposure gets a
+    fresh seq. Filename expressions use Burr.seq, Burr.targ and Burr.mode.
     """
 
     seq: str
     targ: str
     mode: str
+
+
+_FILE_NAME_TEMPLATE = (
+    'f"{datetime.now(UTC):%Y%m%dT%H%M%S}_{Burr.mode}_{Burr.targ}'
+    '_{Task.task_id}_{Instrument.name.encode().hex()}'
+    '_f{Collect.frame_number}.fits"'
+)
 
 
 def to_sk_target(burr_target) -> Target:
@@ -262,4 +259,292 @@ def _altaz_to_equatorial(
     return Equatorial(
         ra=float(icrs_coord.ra.deg),
         dec=float(icrs_coord.dec.deg),
+    )
+
+def build_requested_tasks(
+    run: BurrRun,
+    config: AppConfig,
+    request: ObservationRequest,
+    collect: CollectConfig | None = None,
+) -> list[sk.TaskSubmission]:
+    if "flat_plan" in request.metadata:
+        return [build_planned_flat_task(run, request, collect)]
+
+    return list(build_sk_tasks(run, config, request, collect))
+
+
+def build_sk_tasks(
+    run: BurrRun,
+    config: AppConfig,
+    request: ObservationRequest,
+    collect: CollectConfig | None = None,
+) -> Iterator[sk.TaskSubmission]:
+    """Translate ordinary requests; execution identity is assigned by SensorKit."""
+    collect = collect or CollectConfig()
+    parts = _tracking_parts(
+        [spec.tracking_mode for spec in request.exposure_map]
+    )
+    frame_type = (
+        FrameType.FLAT
+        if request.source_name == "twilight_flats"
+        else FrameType.LIGHT
+    )
+    end_time = run.lighting_schedule.schedule_end_utc
+
+    for seconds in request.exposure_seconds:
+        # Sample a rate distribution once per requested exposure.
+        rates = _concrete_rates(request, seconds)
+        context = _exposure_context(request)
+
+        for mode, count, sidereal_frames in parts:
+            task = StandardCollectTask(
+                target=_tracking_target(request, config, mode, rates),
+                camera_params=_camera_params(
+                    collect, frame_type, seconds, count
+                ),
+                end_time=end_time,
+                sidereal_frames=sidereal_frames,
+            )
+            yield task.submit(
+                context=context,
+                expiry_time=end_time,
+            )
+
+
+def build_planned_flat_task(
+    run: BurrRun,
+    request: ObservationRequest,
+    collect: CollectConfig | None = None,
+) -> sk.TaskSubmission:
+    """Keep the plan's pair order, filters and independent exposures."""
+    if request.source_name != "twilight_flats":
+        raise ValueError(
+            "flat_plan is only supported for twilight_flats requests"
+        )
+
+    if not request.exposure_map or any(
+        spec.tracking_mode != TrackingMode.OFF
+        for spec in request.exposure_map
+    ):
+        raise ValueError(
+            "planned flats require a nonempty, untracked exposure_map"
+        )
+
+    entries = request.metadata["flat_plan"]
+    if not entries:
+        raise ValueError(
+            "flat_plan must contain at least one camera/filter pair"
+        )
+
+    collect = collect or CollectConfig()
+    settings_by_instrument = dict(collect.instrument_settings())
+    params = []
+
+    for entry in entries:
+        instrument = entry["instrument"]
+        settings = settings_by_instrument.get(instrument, collect)
+
+        # Preserve camera-setting inheritance while the plan controls filter.
+        settings = settings.model_copy(
+            update={"filter_name": entry["filter"]}
+        )
+        params.append(
+            _parameter_set(
+                instrument,
+                settings,
+                FrameType.FLAT,
+                float(entry["exposure_seconds"]),
+                1,
+            )
+        )
+
+    end_time = run.lighting_schedule.schedule_end_utc
+    task = StandardCollectTask(
+        target=to_sk_target(request.target),
+        camera_params=params,
+        end_time=end_time,
+    )
+    return task.submit(
+        context=_exposure_context(request),
+        expiry_time=end_time,
+    )
+
+
+def _tracking_parts(
+    modes: list[TrackingMode],
+) -> list[tuple[TrackingMode, int, list[int]]]:
+    """Preserve uniform and two-phase tracking patterns."""
+    if not modes:
+        raise ValueError("exposure_map must not be empty")
+
+    count = len(modes)
+
+    if TrackingMode.RATE not in modes:
+        mode = (
+            TrackingMode.SIDEREAL
+            if TrackingMode.SIDEREAL in modes
+            else TrackingMode.OFF
+        )
+        return [(mode, count, [])]
+
+    if all(mode == TrackingMode.RATE for mode in modes):
+        return [(TrackingMode.RATE, count, [])]
+
+    first_rate = modes.index(TrackingMode.RATE)
+
+    if first_rate == 0:
+        split = next(
+            i
+            for i, mode in enumerate(modes)
+            if mode != TrackingMode.RATE
+        )
+        if all(
+            mode != TrackingMode.RATE for mode in modes[split:]
+        ):
+            return [
+                (
+                    TrackingMode.RATE,
+                    count,
+                    list(range(split, count)),
+                )
+            ]
+
+    elif all(
+        mode == TrackingMode.RATE for mode in modes[first_rate:]
+    ):
+        before = (
+            TrackingMode.SIDEREAL
+            if TrackingMode.SIDEREAL in modes[:first_rate]
+            else TrackingMode.OFF
+        )
+        return [
+            (before, first_rate, []),
+            (TrackingMode.RATE, count - first_rate, []),
+        ]
+
+    raise ValueError("unsupported tracking interleaving")
+
+
+def _concrete_rates(
+    request: ObservationRequest,
+    seconds: float,
+) -> Rates | None:
+    if isinstance(request.target, TLETarget) or not any(
+        spec.tracking_mode == TrackingMode.RATE
+        for spec in request.exposure_map
+    ):
+        return None
+
+    if request.rates is None:
+        raise ValueError(
+            "RATE frames require tracking rates or a TLE target"
+        )
+
+    if isinstance(request.rates, Rates):
+        return request.rates
+
+    return request.rates.to_concrete_rates(seconds)
+
+
+def _tracking_target(
+    request: ObservationRequest,
+    config: AppConfig,
+    mode: TrackingMode,
+    rates: Rates | None,
+) -> Target:
+    if mode == TrackingMode.SIDEREAL:
+        return to_sk_sidereal_target(
+            request.target,
+            site=config.site,
+        )
+
+    if mode == TrackingMode.OFF or isinstance(request.target, TLETarget):
+        return to_sk_target(request.target)
+
+    if rates is None:
+        raise ValueError("RATE frames require concrete tracking rates")
+
+    return to_sk_ratetarget(
+        request.target,
+        rates,
+        site=config.site,
+        frame=ReferenceFrame(config.sk.rate_target_frame),
+    )
+
+
+def _parameter_set(
+    instrument: str | None,
+    settings: CameraSettings,
+    frame_type: FrameType,
+    seconds: float,
+    count: int,
+) -> CameraParameterSet:
+    if (
+        instrument is not None
+        and "instrument" not in CameraParameterSet.model_fields
+    ):
+        raise ValueError(
+            "this SensorKit cannot pin an exposure to an instrument"
+        )
+
+    return CameraParameterSet(
+        instrument=instrument,
+        frame_type=frame_type,
+        integration_time_seconds=seconds,
+        frame_count=count,
+        filter_name=settings.filter_name,
+        readout_mode=settings.readout_mode,
+        gain=settings.gain,
+        binning_x=settings.binning,
+        binning_y=settings.binning,
+    )
+
+
+def _camera_params(
+    collect: CollectConfig,
+    frame_type: FrameType,
+    seconds: float,
+    count: int,
+) -> CameraParameterSet | list[CameraParameterSet]:
+    params = [
+        _parameter_set(
+            instrument, settings, frame_type, seconds, count
+        )
+        for instrument, settings in collect.instrument_settings()
+    ]
+    return params if collect.instruments is not None else params[0]
+
+
+def _exposure_context(
+    request: ObservationRequest,
+) -> sk.KeywordDict:
+    metadata = request.metadata
+    target = next(
+        (
+            metadata[key]
+            for key in (
+                "target_name",
+                "star_name",
+                "satellite_name",
+                "pixel_id",
+                "norad_id",
+            )
+            if metadata.get(key)
+        ),
+        request.task_id,
+    )
+    safe_target = (
+        str(target)
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("\\", "_")
+    )
+
+    return sk.KeywordDict(
+        BurrContext(
+            seq=str(uuid.uuid4()),
+            targ=safe_target,
+            mode=request.source_name,
+        ),
+        FileNameTemplate(template=_FILE_NAME_TEMPLATE),
     )

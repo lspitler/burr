@@ -34,7 +34,6 @@ Implements the TaskSource protocol defined in burr.task_source.protocol.
 from __future__ import annotations
 
 import time
-import uuid as uuidlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1113,13 +1112,12 @@ class FlatFieldManager:
         return self._clip_exposure(estimate)
 
     def _planned_request(self, task_id: str) -> ObservationRequest | None:
-        """One request with its own pinned exposure for every incomplete planned pair.
+        """One request with its own pinned exposure for every incomplete pair.
 
-        ``metadata["flat_plan"]`` lists, per pair, the camera, the SensorKit
-        instrument to pin, the filter, its exposure and a ``request_id``. The
-        SensorKit burr program turns each entry into its own
-        ``CameraParameterSet``. ``exposure_seconds`` holds the shortest, only
-        to keep the request well formed.
+        ``metadata["flat_plan"]`` lists the camera, instrument, filter and
+        exposure for each pair. Burr's SensorKit adapter turns each entry
+        into its own ``CameraParameterSet``. ``exposure_seconds`` holds the
+        shortest exposure only to keep the request well formed.
         """
         now = datetime.now(ZoneInfo("UTC"))
         if self.plan.filter_sequencing == "per_filter":
@@ -1136,7 +1134,6 @@ class FlatFieldManager:
                 "instrument": self._planned[key].instrument,
                 "filter": key.filter,
                 "exposure_seconds": self._pair_exposure(key, now=now),
-                "request_id": str(uuidlib.uuid4()),
             }
             for key in ordered_pairs
         ]
