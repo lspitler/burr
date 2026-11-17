@@ -246,7 +246,6 @@ def test_entry_point_declares_one_named_program(section, monkeypatch):
     settings = BurrServiceConfig.model_validate(section)
     context = SimpleNamespace(collect=settings.collect)
     monkeypatch.setattr(program, "initialize_engine", Mock())
-    monkeypatch.setattr(program, "setup_loguru", Mock())
     monkeypatch.setattr(program, "_load_settings", AsyncMock(return_value=(
         SimpleNamespace(logging=SimpleNamespace(level="INFO")), settings.collect,
     )))
@@ -272,3 +271,50 @@ def test_entry_point_declares_one_named_program(section, monkeypatch):
         assert program._ctx is None
 
     asyncio.run(run())
+
+
+def test_service_start_keeps_the_host_logging_sinks(section, monkeypatch):
+    """11-17: main() called setup_loguru(), whose remove() deleted SensorKit's
+    --log-file sink (loguru is process-global), so log.txt went silent."""
+    from loguru import logger
+
+    settings = BurrServiceConfig.model_validate(section)
+    host_lines: list[str] = []
+    host_sink = logger.add(host_lines.append, level="DEBUG", format="{message}")
+    monkeypatch.setattr(program, "initialize_engine", Mock())
+    monkeypatch.setattr(program, "_load_settings", AsyncMock(return_value=(
+        SimpleNamespace(logging=SimpleNamespace(level="INFO")), settings.collect,
+    )))
+    monkeypatch.setattr(program, "_build_context", Mock(return_value=SimpleNamespace(collect=settings.collect)))
+
+    async def run_without_backend(service):
+        service.running.set_result(True)
+        await service.shutdown
+
+    monkeypatch.setattr(sk.Service, "run", run_without_backend)
+
+    async def run():
+        service, task = await program.main.run("Burr")
+        try:
+            logger.debug("host debug line after burr start-up")
+        finally:
+            service.shutdown.set_result(True)
+            await task
+
+    try:
+        asyncio.run(run())
+        assert any("host debug line after burr start-up" in line for line in host_lines)
+    finally:
+        logger.remove(host_sink)
+
+
+def test_burr_sk_cli_reads_its_log_level_from_the_standalone_config(tmp_path):
+    from burr.cli.sk import _standalone_log_level
+
+    site = tmp_path / "site.yaml"
+    site.write_text("app:\n  logging:\n    level: DEBUG\n")
+    preset = tmp_path / "preset.yaml"
+    preset.write_text("app:\n  schedule: {}\n")
+    assert _standalone_log_level([site, preset]) == "DEBUG"
+    assert _standalone_log_level([preset]) == "INFO"
+    assert _standalone_log_level([]) == "INFO"

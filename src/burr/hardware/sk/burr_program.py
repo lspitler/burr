@@ -70,7 +70,6 @@ from burr.core.config import (
     initialize_config,
     set_config,
 )
-from burr.core.logging import setup_loguru
 from burr.hardware.sk.service_config import BurrServiceConfig, service_config_for
 from burr.hardware.sk.settings import CollectConfig
 from burr.hardware.sk.tasks import build_requested_tasks
@@ -689,7 +688,11 @@ async def main(service: sk.Service) -> None:
     # Finish synchronous setup before registering program callbacks.
     await asyncio.to_thread(initialize_engine)
     config, collect = await _load_settings(service)
-    setup_loguru(level=config.logging.level)
+    # Don't call setup_loguru() here: this runs inside the host's process
+    # (`sensorkit go` / `sensorkit service run`), and loguru is process-global,
+    # so its remove() would delete SensorKit's own sinks (11-17: log.txt went
+    # silent and all output moved to the venv's app.log). The host owns
+    # logging; the standalone `burr-sk` CLI sets it up before starting here.
     _ctx = await asyncio.to_thread(_build_context, config, collect)
 
     declaration = sk.declare_program()

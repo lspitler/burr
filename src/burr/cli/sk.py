@@ -20,6 +20,23 @@ from pathlib import Path
 
 from loguru import logger
 
+from burr.core.logging import setup_loguru
+
+
+def _standalone_log_level(paths: list[Path]) -> str:
+    """``logging.level`` from the standalone config files, or INFO.
+
+    Read here, before the service starts, because the full AppConfig is only
+    built inside the service entrypoint. Without explicit paths (the unified
+    SensorKit burr: section) burr-sk logs at INFO.
+    """
+    if not paths:
+        return "INFO"
+    from burr.core.config import load_yaml_merged
+
+    level = (load_yaml_merged(paths).get("logging") or {}).get("level", "INFO")
+    return str(level)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -90,6 +107,10 @@ def main() -> int:
     from sensorkit.api.entrypoint import ShutdownSignal, run_services
 
     from burr.hardware.sk.burr_program import main as burr_main
+
+    # burr-sk owns its process, so it configures logging (the service
+    # entrypoint itself must not: under `sensorkit go` it shares the host's).
+    setup_loguru(level=_standalone_log_level(paths))
 
     exit_code = 0
     try:
