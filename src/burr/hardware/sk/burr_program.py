@@ -51,6 +51,7 @@ request completion or failure to Burr's task sources.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
 from collections import deque
@@ -83,6 +84,10 @@ from burr.scheduler.slot import TaskSlot
 from burr.task_source.protocol import TaskSource
 
 
+OFFER_REFRESH_SECONDS = 30 * 60
+OFFER_RETRY_SECONDS = 60
+
+
 @dataclass
 class _RequestState:
     slot: TaskSlot
@@ -106,6 +111,11 @@ class _ProgramContext:
     scheduler: Scheduler
     collect: CollectConfig = field(default_factory=CollectConfig)
     pending: deque[_PendingTask] = field(default_factory=deque)
+    active: _RequestState | None = None
+    building_request: bool = False
+    rolling_over: bool = False
+    offer_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
+    offer_task: asyncio.Task[None] | None = None
 
 
 _ctx: _ProgramContext | None = None
@@ -121,8 +131,86 @@ def _current_condition(ctx: _ProgramContext) -> LightingCondition:
     return ctx.run.lighting_schedule.get_lighting_condition(datetime.now(UTC))
 
 
-async def _publish_offers() -> None:
-    ctx = _context()
+def _run_covers(ctx: _ProgramContext, when: datetime) -> bool:
+    """Return whether the current run owns the observing night at ``when``."""
+    schedule = ctx.run.lighting_schedule
+    when = when.astimezone(UTC) if when.tzinfo else when.replace(tzinfo=UTC)
+    return schedule.schedule_start_utc <= when < schedule.schedule_end_utc
+
+
+def _build_run_and_scheduler(
+    config: AppConfig,
+    observation_date: datetime,
+) -> tuple[BurrRun, Scheduler]:
+    """Build the run and scheduler for the observing night containing a date."""
+    run = get_or_create_run(
+        site=config.site,
+        observation_date=observation_date,
+        verbose=True,
+        new_config=config,
+    )
+    sources = build_task_sources(run, config)
+    return run, build_scheduler(config, run, sources)
+
+
+def _rollover_is_busy(ctx: _ProgramContext) -> bool:
+    """Return whether replacing the run could split an in-flight Burr request."""
+    return ctx.building_request or ctx.active is not None or bool(ctx.pending)
+
+
+async def _rollover_if_needed(
+    ctx: _ProgramContext,
+    when: datetime | None = None,
+) -> bool:
+    """Replace a stale run and scheduler when no Burr request is in progress."""
+    when = when or datetime.now(UTC)
+    when = when.astimezone(UTC) if when.tzinfo else when.replace(tzinfo=UTC)
+    if _run_covers(ctx, when):
+        return False
+
+    if _rollover_is_busy(ctx):
+        logger.info(
+            "Observing night changed; deferring Burr run rollover until "
+            "the current request finishes"
+        )
+        return False
+
+    old_run_id = ctx.run.run_id
+    ctx.rolling_over = True
+    try:
+        run, scheduler = await asyncio.to_thread(
+            _build_run_and_scheduler,
+            ctx.config,
+            when,
+        )
+    finally:
+        ctx.rolling_over = False
+    if not (
+        run.lighting_schedule.schedule_start_utc
+        <= when
+        < run.lighting_schedule.schedule_end_utc
+    ):
+        raise RuntimeError(
+            "Burr rebuilt a run that does not cover the current observing night"
+        )
+
+    ctx.run = run
+    ctx.scheduler = scheduler
+    logger.info(
+        f"Burr observing night rolled over from {old_run_id} to {run.run_id}"
+    )
+    return True
+
+
+async def _clear_offers() -> None:
+    """Remove all currently advertised Burr windows."""
+    program = sk.program()
+    program.clear_offers()
+    await program.publish_offers()
+
+
+async def _publish_offers(ctx: _ProgramContext | None = None) -> None:
+    ctx = ctx or _context()
     intervals = await asyncio.to_thread(
         ctx.scheduler.offer_windows,
         ctx.run.lighting_schedule,
@@ -140,12 +228,77 @@ async def _publish_offers() -> None:
     )
 
 
+async def _refresh_offers(ctx: _ProgramContext) -> None:
+    """Move to the current observing night, then publish its offer windows."""
+    now = datetime.now(UTC)
+    stale = not _run_covers(ctx, now)
+    if stale:
+        # Remove expired windows before the potentially slow run rebuild so
+        # status and election cannot continue to expose the previous night.
+        await _clear_offers()
+
+    await _rollover_if_needed(ctx, now)
+
+    if not _run_covers(ctx, now):
+        # Do not leave the previous night's windows advertised while a request
+        # is finishing or a replacement run cannot yet be created.
+        return
+
+    await _publish_offers(ctx)
+
+
+async def _offer_loop(ctx: _ProgramContext) -> None:
+    """Refresh offers periodically and promptly after lifecycle/task changes."""
+    delay = OFFER_REFRESH_SECONDS
+    while True:
+        try:
+            await asyncio.wait_for(ctx.offer_wakeup.wait(), timeout=delay)
+        except TimeoutError:
+            pass
+        ctx.offer_wakeup.clear()
+
+        try:
+            await _refresh_offers(ctx)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Could not refresh Burr observing-night offers")
+            with contextlib.suppress(Exception):
+                await _clear_offers()
+            delay = OFFER_RETRY_SECONDS
+        else:
+            delay = OFFER_REFRESH_SECONDS
+
+
+def _start_offer_loop(ctx: _ProgramContext) -> None:
+    """Start the one background offer loop, or wake the existing loop."""
+    if ctx.offer_task is None or ctx.offer_task.done():
+        ctx.offer_task = asyncio.create_task(
+            _offer_loop(ctx),
+            name="burr-offer-refresh",
+        )
+    ctx.offer_wakeup.set()
+
+
+async def _stop_offer_loop(ctx: _ProgramContext) -> None:
+    """Stop the background offer loop, if one is running."""
+    task = getattr(ctx, "offer_task", None)
+    if not hasattr(ctx, "offer_task"):
+        return
+    ctx.offer_task = None
+    if task is None:
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
 async def _on_attach() -> None:
-    await _publish_offers()
+    _start_offer_loop(_context())
 
 
 async def _on_enable() -> None:
-    await _publish_offers()
+    _start_offer_loop(_context())
 
 
 async def _on_disable() -> None:
@@ -157,11 +310,13 @@ async def _on_disable() -> None:
         batch,
         "Burr disabled before the request completed",
     )
+    ctx.offer_wakeup.set()
     # Keep bounded offers advertised so the agent can enable Burr again.
 
 
 async def _on_detach() -> None:
     ctx = _context()
+    await _stop_offer_loop(ctx)
     batch = list(ctx.pending)
     ctx.pending.clear()
     await _abandon_batch(ctx, batch, "Burr service stopped")
@@ -312,6 +467,7 @@ async def _abandon_batch(
 async def _fill_queue(ctx: _ProgramContext) -> None:
     # Cancellation cannot stop the worker thread. Wait for its result
     # and account for any request it built before propagating cancellation.
+    ctx.building_request = True
     worker = asyncio.create_task(asyncio.to_thread(_build_next_request, ctx))
     try:
         batch = await asyncio.shield(worker)
@@ -323,6 +479,9 @@ async def _fill_queue(ctx: _ProgramContext) -> None:
             "Burr stopped before request dispatch",
         )
         raise
+    finally:
+        ctx.building_request = False
+        ctx.offer_wakeup.set()
 
     ctx.pending.extend(batch)
 
@@ -351,6 +510,9 @@ async def _next_task():
     """Yield once, receive an execution, and await actual completion."""
     ctx = _context()
 
+    if ctx.rolling_over:
+        return
+
     if not ctx.pending:
         await _fill_queue(ctx)
     if not ctx.pending:
@@ -358,6 +520,7 @@ async def _next_task():
 
     pending = ctx.pending.popleft()
     state = pending.state
+    ctx.active = state
 
     try:
         await _validate_instruments(ctx)
@@ -406,6 +569,11 @@ async def _next_task():
             str(exc),
         )
         raise
+
+    finally:
+        if ctx.active is state:
+            ctx.active = None
+        ctx.offer_wakeup.set()
 
 
 def build_task_sources(
@@ -456,18 +624,16 @@ def _build_context(
     config: AppConfig,
     collect: CollectConfig | None = None,
 ) -> _ProgramContext:
-    run = get_or_create_run(
-        site=config.site,
-        verbose=True,
-        new_config=config,
+    run, scheduler = _build_run_and_scheduler(
+        config,
+        datetime.now(UTC),
     )
-    sources = build_task_sources(run, config)
 
     return _ProgramContext(
         run=run,
         config=config,
         controller_entity=config.sk.burr_controller_entity,
-        scheduler=build_scheduler(config, run, sources),
+        scheduler=scheduler,
         collect=collect or CollectConfig(),
     )
 
@@ -537,4 +703,6 @@ async def main(service: sk.Service) -> None:
     try:
         await service.run()
     finally:
+        if _ctx is not None:
+            await _stop_offer_loop(_ctx)
         _ctx = None
