@@ -274,6 +274,7 @@ class FlatFieldManager:
         self.twilight_record_max_age = self.config.twilight_record_max_age_seconds
         self.seed_min_counts = self.config.seed_min_counts
         self._offer_windows: list[tuple[datetime, datetime]] | None = None
+        self._exhausted_logged: tuple[str, object] | None = None
         self.maximum_exposure = self.config.maximum_exposure_seconds
         self.sky_doubling_seconds = self.config.sky_doubling_seconds
         self.cutout_size = self.config.cutout_size
@@ -348,16 +349,50 @@ class FlatFieldManager:
             for window in self.config.windows
         ]
 
-    def offer_windows(self) -> list[tuple[datetime, datetime]]:
-        """This source's windows, clipped by the dawn-start / dusk-end Sun altitudes.
+    def offer_windows(
+        self, now: datetime | None = None, *, withdraw_finished: bool = True
+    ) -> list[tuple[datetime, datetime]]:
+        """This source's windows, clipped by Sun altitude and by what is left to do.
 
-        Without either limit it is just the configured lighting windows. With
-        them, a dawn window opens no earlier than the Sun reaching
+        Without the Sun limits it is just the configured lighting windows.
+        With them, a dawn window opens no earlier than the Sun reaching
         ``dawn_start_sun_altitude_deg`` and a dusk window closes no later than
-        the Sun setting to ``dusk_end_sun_altitude_deg``. SensorKit offers
-        these windows, so the minutes cut off go to other programs instead of
-        an idle Burr.
+        the Sun setting to ``dusk_end_sun_altitude_deg``.
+
+        Once nothing is left for the twilight containing ``now`` (see
+        ``twilight_done``), that window ends at ``now``, so SensorKit gives the
+        rest of it to the next program instead of an idle Burr (11-17 dusk:
+        12 min lost). Other windows, such as dawn after dusk, are unchanged.
+        SensorKit offers these windows. ``withdraw_finished=False`` skips the
+        withdrawal (the caller has a request in flight).
         """
+        windows = self._sun_clipped_windows()
+        now = now or datetime.now(ZoneInfo("UTC"))
+        if not withdraw_finished or not self.twilight_done(now):
+            return windows
+        # End the current window at now; a window that would be empty (now == its start) is dropped.
+        return [
+            (start, now if start <= now < end else end)
+            for start, end in windows
+            if start != now
+        ]
+
+    def twilight_done(self, now: datetime) -> bool:
+        """True when nothing more can be collected in the twilight containing ``now``.
+
+        With a plan: every pair is complete, or (``per_filter``) every remaining
+        pair is exhausted for this twilight. Exhaustion is judged on this
+        twilight's records only, so the next twilight starts fresh. Batched
+        plans never give up mid-twilight. Without a plan: collection complete.
+        """
+        if self.is_collection_complete():
+            return True
+        if self.plan is None or self.plan.filter_sequencing != "per_filter":
+            return False
+        return not self._filter_phase_pairs(now)
+
+    def _sun_clipped_windows(self) -> list[tuple[datetime, datetime]]:
+        """The configured lighting windows, clipped by the dawn-start / dusk-end Sun altitudes."""
         if self._offer_windows is None:
             schedule = self.run.lighting_schedule
             windows = schedule.merged_windows_for(self.suitable_conditions)
@@ -374,7 +409,7 @@ class FlatFieldManager:
         """True if a Sun-altitude limit is set and ``now`` is outside the clipped windows."""
         if self.config.dawn_start_sun_altitude_deg is None and self.config.dusk_end_sun_altitude_deg is None:
             return False
-        return not any(start <= now <= end for start, end in self.offer_windows())
+        return not any(start <= now <= end for start, end in self._sun_clipped_windows())
 
     @property
     def good_frames(self) -> int:
@@ -1111,6 +1146,17 @@ class FlatFieldManager:
 
         return self._clip_exposure(estimate)
 
+    def _log_exhausted_once(self, now: datetime) -> None:
+        """Log "all exhausted" once per twilight: SensorKit retries every 5 s until the offer is withdrawn."""
+        twilight = ("dawn" if self._is_dawn(now) else "dusk", now.date())
+        if self._exhausted_logged == twilight:
+            return
+        self._exhausted_logged = twilight
+        logger.info(
+            "Every remaining flat pair is exhausted for this twilight; no request, "
+            f"withdrawing the rest of this window ({self.progress_totals()})"
+        )
+
     def _planned_request(self, task_id: str) -> ObservationRequest | None:
         """One request with its own pinned exposure for every incomplete pair.
 
@@ -1123,7 +1169,7 @@ class FlatFieldManager:
         if self.plan.filter_sequencing == "per_filter":
             ordered_pairs = self._filter_phase_pairs(now)
             if not ordered_pairs:
-                logger.info("Every remaining flat pair is exhausted for this twilight; no request")
+                self._log_exhausted_once(now)
                 return None
         else:
             ordered_pairs = self._ordered_remaining_pairs(now)

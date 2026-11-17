@@ -268,7 +268,9 @@ def test_offers_use_clipped_windows_and_remove_stale_offers(setup, monkeypatch):
     asyncio.run(program._publish_offers())
 
     assert advertised == windows
-    ctx.scheduler.offer_windows.assert_called_once_with(ctx.run.lighting_schedule)
+    ctx.scheduler.offer_windows.assert_called_once_with(
+        ctx.run.lighting_schedule, withdraw_finished=False  # setup leaves a task pending
+    )
 
 
 @pytest.mark.parametrize(
@@ -436,3 +438,27 @@ def test_task_build_failure_is_reported_to_the_source(setup, monkeypatch):
         pending.state.request,
         "bad flat plan",
     )
+
+
+@pytest.mark.parametrize(
+    ("busy", "withdraw"),
+    [("pending", False), ("active", False), ("building", False), (None, True)],
+)
+def test_offers_never_withdraw_a_finished_twilight_mid_request(setup, monkeypatch, busy, withdraw):
+    """A finished twilight's window is withdrawn only once no Burr request is in progress."""
+    ctx, pending, _source, _slot = setup
+    ctx.pending.clear()
+    if busy == "pending":
+        ctx.pending.append(pending)
+    elif busy == "active":
+        ctx.active = pending.state
+    elif busy == "building":
+        ctx.building_request = True
+    ctx.scheduler.offer_windows = Mock(return_value=[])
+    ctx.scheduler.log_status = Mock()
+    published = SimpleNamespace(clear_offers=Mock(), add_offer=Mock(), publish_offers=AsyncMock())
+    monkeypatch.setattr(program.sk, "program", lambda: published)
+
+    asyncio.run(program._publish_offers(ctx))
+
+    assert ctx.scheduler.offer_windows.call_args.kwargs == {"withdraw_finished": withdraw}

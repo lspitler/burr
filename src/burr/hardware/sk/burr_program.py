@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import os
 import time
 from collections import deque
@@ -210,9 +211,15 @@ async def _clear_offers() -> None:
 
 async def _publish_offers(ctx: _ProgramContext | None = None) -> None:
     ctx = ctx or _context()
+    # Never withdraw a finished twilight's window while a Burr request is
+    # building, queued or running: it would pull the controller mid-request.
+    # The refresh after the request finishes withdraws it.
     intervals = await asyncio.to_thread(
-        ctx.scheduler.offer_windows,
-        ctx.run.lighting_schedule,
+        functools.partial(
+            ctx.scheduler.offer_windows,
+            ctx.run.lighting_schedule,
+            withdraw_finished=not _rollover_is_busy(ctx),
+        ),
     )
     program = sk.program()
     program.clear_offers()

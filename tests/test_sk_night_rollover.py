@@ -108,7 +108,7 @@ def test_refresh_clears_stale_offers_before_rebuilding(monkeypatch):
     events: list[str] = []
     window = (now + timedelta(minutes=1), now + timedelta(minutes=10))
     new_scheduler = Mock()
-    new_scheduler.offer_windows.side_effect = lambda schedule: (
+    new_scheduler.offer_windows.side_effect = lambda schedule, **_: (
         events.append("offer_windows") or [window]
     )
     new_run = SimpleNamespace(

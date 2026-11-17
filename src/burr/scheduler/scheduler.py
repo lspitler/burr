@@ -93,18 +93,23 @@ class Scheduler:
         )
         return suitable
 
-    def offer_windows(self, schedule) -> list[tuple]:
+    def offer_windows(self, schedule, *, withdraw_finished: bool = True) -> list[tuple]:
         """Merged windows SensorKit should offer for every registered source.
 
         A source with an ``offer_windows()`` method (e.g. twilight flats with
-        a dawn-start Sun altitude) supplies its own, possibly clipped,
-        windows; the others use ``schedule.merged_windows_for`` on their
-        ``suitable_conditions``. Overlapping windows are merged.
+        a dawn-start Sun altitude, or with nothing left this twilight)
+        supplies its own, possibly clipped, windows; the others use
+        ``schedule.merged_windows_for`` on their ``suitable_conditions``.
+        Overlapping windows are merged. ``withdraw_finished=False`` keeps a
+        finished twilight's window, e.g. while a request is still in flight.
         """
         raw: list[tuple] = []
         for slot in self._slots:
             own = getattr(slot.source, "offer_windows", None)
-            raw.extend(own() if callable(own) else schedule.merged_windows_for(slot.source.suitable_conditions))
+            if callable(own):
+                raw.extend(own(withdraw_finished=withdraw_finished))
+            else:
+                raw.extend(schedule.merged_windows_for(slot.source.suitable_conditions))
         merged: list[tuple] = []
         for start, end in sorted(raw):
             if merged and start <= merged[-1][1]:
