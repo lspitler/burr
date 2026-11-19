@@ -1,4 +1,4 @@
-"""task source for targetless DARK and BIAS calibraiton collection"""
+"""Task source for targetless DARK and BIAS calibration collection."""
 
 from __future__ import annotations
 
@@ -69,13 +69,15 @@ class CalibrationFrameManager:
         ]
 
     def offer_windows(
-            self,
-            *,
-            withdraw_finished: bool = True,
+        self,
+        *,
+        withdraw_finished: bool = True,
     ) -> list[tuple]:
-        """return only the explicitly configured calibration windows
-        Once colleciton is complete, withdraw the windows so SensorKit can hand the controller to another program.
-        A window remains advertised while a request is in flight.
+        """Return only the explicitly configured calibration windows.
+
+        Once collection is complete, withdraw the windows so SensorKit can
+        hand the controller to another program. A window remains advertised
+        while a request is in flight.
         """
         if withdraw_finished and self.is_collection_complete():
             return []

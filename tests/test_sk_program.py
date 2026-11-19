@@ -462,3 +462,36 @@ def test_offers_never_withdraw_a_finished_twilight_mid_request(setup, monkeypatc
     asyncio.run(program._publish_offers(ctx))
 
     assert ctx.scheduler.offer_windows.call_args.kwargs == {"withdraw_finished": withdraw}
+
+
+def test_build_task_sources_constructs_enabled_calibration(
+    monkeypatch,
+):
+    calibration_source = object()
+    constructor = Mock(return_value=calibration_source)
+    monkeypatch.setattr(
+        program,
+        "CalibrationFrameManager",
+        constructor,
+    )
+
+    disabled = SimpleNamespace(collect=False)
+    config = SimpleNamespace(
+        schedule=SimpleNamespace(
+            calibration_frames=SimpleNamespace(collect=True),
+            twilight_flats=disabled,
+            lunar_background=disabled,
+            photometric_standards=disabled,
+            coverage=disabled,
+            calsats=disabled,
+        ),
+        sk=SimpleNamespace(data_root=None),
+    )
+    run = object()
+
+    sources = program.build_task_sources(run, config)
+
+    assert sources == {
+        "calibration_frames": calibration_source,
+    }
+    constructor.assert_called_once_with(run=run)

@@ -7,6 +7,7 @@ import pytest
 
 from burr.core.config import CalibrationFramesConfig
 from burr.models.observation import RADecTarget
+from burr.models.site import LightingCondition
 from burr.task_source.calibration.manager import (
     CalibrationFrameManager,
 )
@@ -299,3 +300,29 @@ def test_manager_requires_a_plan():
         match="requires calibration_frames.plan",
     ):
         CalibrationFrameManager(run)
+
+
+def test_offer_windows_use_configured_conditions_and_withdraw_when_complete():
+    manager, _ = make_manager()
+
+    expected_windows = [("start", "end")]
+    merged_windows_for = Mock(return_value=expected_windows)
+    manager.run.lighting_schedule = SimpleNamespace(
+        merged_windows_for=merged_windows_for,
+    )
+
+    assert manager.offer_windows() == expected_windows
+    merged_windows_for.assert_called_once_with(
+        [LightingCondition.DAY]
+    )
+
+    while not manager.is_collection_complete():
+        request = manager.generate_request("calibration-request")
+        manager.on_request_completed(request, 1.0)
+
+    assert manager.offer_windows() == []
+
+    # Keep the window while the final request is still being finalised.
+    assert manager.offer_windows(
+        withdraw_finished=False,
+    ) == expected_windows
