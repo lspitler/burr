@@ -177,3 +177,12 @@ def test_schedule_parses_enabled_calibration_plan():
 
     assert schedule.calibration_frames.collect is True
     assert len(schedule.calibration_frames.plan.sequences) == 3
+
+def test_retry_limit_must_be_nonnegative():
+    with pytest.raises(
+        ValidationError,
+        match="greater than or equal to 0",
+    ):
+        CalibrationFramesConfig(
+            max_request_retries=-1,
+        )

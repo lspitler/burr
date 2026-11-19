@@ -228,6 +228,15 @@ class CalibrationFramesConfig(BaseModel):
         description=("Max time to wait for SensorKit calibration FITS files to finish writing")
     )
 
+    max_request_retries: int = Field(
+        default =2,
+        ge=0,
+        description=(
+            "Number of times a failed calibration sequence group may be" \
+            "retried after its first failed attempt"
+        )
+    )
+
     plan: CalibrationPlanConfig | None = Field(
         default = None,
         description=("Explicit per camera DARK and BIAS collection plan")
