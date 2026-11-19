@@ -82,6 +82,7 @@ from burr.scheduler.factory import build_scheduler
 from burr.scheduler.scheduler import Scheduler
 from burr.scheduler.slot import TaskSlot
 from burr.task_source.protocol import TaskSource
+from burr.task_source.calibration.manager import CalibrationFrameManager
 
 
 OFFER_REFRESH_SECONDS = 30 * 60
@@ -598,6 +599,11 @@ def build_task_sources(
 
     schedule = config.schedule
     sources: dict[str, TaskSource] = {}
+
+    if schedule.calibration_frames.collect:
+        sources["calibration_frames"] = CalibrationFrameManager(
+            run=run,
+        )
 
     if schedule.twilight_flats.collect:
         sources["twilight_flats"] = FlatFieldManager(

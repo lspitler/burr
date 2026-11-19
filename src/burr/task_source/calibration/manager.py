@@ -32,9 +32,7 @@ class CalibrationFrameManager:
     Sequences with the same filter, frame type and exposure are grouped into
     one request so sensorkit can collect that calibration condition from several cameras together.
 
-    Until calibration FITS readback is implemented, a successful SensorKit request counts
-    its requested frames as completed, this manager must not be registered for live collection until readback
-    replaces that behaviour.
+    This source is disabled by default, until calibration FITS readback is implemented.
     """
 
     def __init__(self, run: BurrRun):
@@ -69,6 +67,21 @@ class CalibrationFrameManager:
             LightingCondition(window.lower())
             for window in self.config.windows
         ]
+
+    def offer_windows(
+            self,
+            *,
+            withdraw_finished: bool = True,
+    ) -> list[tuple]:
+        """return only the explicitly configured calibration windows
+        Once colleciton is complete, withdraw the windows so SensorKit can hand the controller to another program.
+        A window remains advertised while a request is in flight.
+        """
+        if withdraw_finished and self.is_collection_complete():
+            return []
+        return self.run.lighting_schedule.merged_windows_for(
+            self.suitable_conditions
+        )
 
     @property
     def all_targets_met(self) -> bool:

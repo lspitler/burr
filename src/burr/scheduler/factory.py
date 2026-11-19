@@ -46,6 +46,16 @@ def build_scheduler(
     """
     scheduler = Scheduler()
 
+    # register SK camera only calibration collection
+    # Its configured windows must represent periods safe for targetless
+    # DARK / BIAS collection
+    if "calibration_frames" in sources:
+        scheduler.register(
+            source=sources["calibraiton_frames"],
+            priority=0,
+            strategy=OneShotStrategy
+        )
+
     # Register twilight flats (one_shot, priority 1)
     if "twilight_flats" in sources:
         scheduler.register(
