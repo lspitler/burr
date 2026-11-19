@@ -44,8 +44,13 @@ class BurrServiceConfig(BaseModel):
     @model_validator(mode="after")
     def _require_plan_readback(self) -> Self:
         flats = self.schedule.twilight_flats
+        calibration = self.schedule.calibration_frames
+
         if flats.collect and flats.plan is not None and self.raw_data_root is None:
             raise ValueError("raw_data_root is required for planned SensorKit flats")
+        if calibration.collect and self.raw_data_root is None:
+            raise ValueError("raw_data_root is required for SensorKit calibration frames")
+
         return self
 
     async def to_app_config(self, kit: sk.SensorKit) -> AppConfig:

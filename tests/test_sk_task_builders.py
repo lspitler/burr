@@ -113,26 +113,29 @@ def calibration_request():
         rates=None,
         metadata={
             "target_name": "calibration",
-            "calibration_plan": [
-                {
-                    "camera": "C1",
-                    "instrument": "west",
-                    "filter": "Blank",
-                    "frame_type": "dark",
-                    "exposure_seconds": 30.0,
-                    "frame_count": 2,
-                },
-                {
-                    "camera": "C0",
-                    "instrument": "east",
-                    "filter": "Blank",
-                    "frame_type": "bias",
-                    "exposure_seconds": 0.0,
-                    "frame_count": 3,
-                },
-            ],
+            "calibration_plan": {
+                "frames_per_sequence": 2,
+                "sequences": [
+                    {
+                        "camera": "C1",
+                        "instrument": "west",
+                        "filter": "Blank",
+                        "frame_type": "dark",
+                        "exposure_seconds": 30.0,
+                    },
+                    {
+                        "camera": "C0",
+                        "instrument": "east",
+                        "filter": "Blank",
+                        "frame_type": "bias",
+                        "exposure_seconds": 0.0,
+                        "frames": 3,
+                    },
+                ],
+            },
         },
     )
+
 
 
 @pytest.fixture
@@ -553,7 +556,7 @@ def test_calibration_request_requires_no_target(inputs):
 def test_calibration_request_rejects_empty_plan(inputs):
     run, config = inputs
     request = calibration_request()
-    request.metadata["calibration_plan"] = []
+    request.metadata["calibration_plan"]["sequences"] = []
 
     with pytest.raises(ValueError, match="at least one sequence"):
         build_requested_tasks(run, config, request)
@@ -562,9 +565,11 @@ def test_calibration_request_rejects_empty_plan(inputs):
 def test_calibration_request_rejects_light_frames(inputs):
     run, config = inputs
     request = calibration_request()
-    request.metadata["calibration_plan"][0]["frame_type"] = "light"
+    request.metadata["calibration_plan"]["sequences"][0][
+        "frame_type"
+    ] = "light"
 
-    with pytest.raises(ValueError, match="DARK or BIAS"):
+    with pytest.raises(ValueError, match="dark.*bias"):
         build_requested_tasks(run, config, request)
 
 
@@ -585,7 +590,7 @@ def test_calibration_request_rejects_tracking_frames(inputs):
 def test_dark_requires_positive_exposure(inputs):
     run, config = inputs
     request = calibration_request()
-    request.metadata["calibration_plan"][0][
+    request.metadata["calibration_plan"]["sequences"][0][
         "exposure_seconds"
     ] = 0.0
 

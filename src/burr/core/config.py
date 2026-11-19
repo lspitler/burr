@@ -2,10 +2,11 @@ import logging
 from pathlib import Path
 from typing import Literal, Optional, List
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from burr.models.site import SiteMetadata
 from burr.models.hardware import HardwareConfig
+from burr.task_source.calibration.plan import CalibrationPlanConfig
 from burr.task_source.flats.plan import FlatPlanConfig
 
 
@@ -206,6 +207,55 @@ class TwilightFlatsConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+class CalibrationFramesConfig(BaseModel):
+    """Sensorkit configuration for camera-only DARK and BIAS collection"""
+    windows: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Lighting conditions during which calibration frames may run"
+        )
+    )
+    collect: bool = Field(
+        default=False,
+        description=(
+            "Wether to schedule targetless Sensorkit calibration frames"
+        )
+    )
+
+    frame_settle_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description=("Max time to wait for SensorKit calibration FITS files to finish writing")
+    )
+
+    plan: CalibrationPlanConfig | None = Field(
+        default = None,
+        description=("Explicit per camera DARK and BIAS collection plan")
+    )
+
+    scheduling: OneTimeSchedulingConfig = Field(
+        default_factory=OneTimeSchedulingConfig,
+        description="Scheduling configuration"
+    )
+
+    model_config = ConfigDict(frozen=True)
+
+    @model_validator(mode="after")
+    def _enabled_configuration_is_complete(
+        self,
+    ) -> "CalibrationFramesConfig":
+        if not self.collect:
+            return self
+        if not self.windows:
+            raise ValueError(
+                "calibration_frames.windows is required when collection is enabled"
+            )
+        if self.plan is None:
+            raise ValueError(
+                "calibration_frames.plan is required when collection is enabled"
+            )
+        return self
+
 
 class DarksConfig(BaseModel):
     """Configuration for dark frame collection."""
@@ -316,6 +366,10 @@ class ScheduleConfig(BaseModel):
 
     twilight_flats: TwilightFlatsConfig = Field(
         default_factory=TwilightFlatsConfig, description="Twilight flats collection configuration"
+    )
+    calibration_frames: CalibrationFramesConfig = Field(
+        default_factory=CalibrationFramesConfig,
+        description=("SensorKit dark and bias calibration frames configuration")
     )
     darks: DarksConfig = Field(default_factory=DarksConfig, description="Dark frame collection configuration")
     calsats: CalsatsConfig = Field(

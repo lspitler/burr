@@ -118,6 +118,41 @@ def test_planned_flats_require_the_raw_data_root(section):
     with pytest.raises(ValueError, match="raw_data_root"):
         BurrServiceConfig.model_validate(section)
 
+def test_calibration_frames_require_the_raw_data_root(section):
+    section["schedule"]["twilight_flats"] = {
+        "collect": False,
+    }
+    section["schedule"]["calibration_frames"] = {
+        "collect": True,
+        "windows": ["day"],
+        "plan": {
+            "frames_per_sequence": 20,
+            "sequences": [
+                {
+                    "camera": "C0",
+                    "instrument": "C0-ASI183MM",
+                    "filter": "Blank",
+                    "frame_type": "bias",
+                    "exposure_seconds": 0.0,
+                },
+                {
+                    "camera": "C0",
+                    "instrument": "C0-ASI183MM",
+                    "filter": "Blank",
+                    "frame_type": "dark",
+                    "exposure_seconds": 30.0,
+                },
+            ],
+        },
+    }
+    section.pop("raw_data_root")
+
+    with pytest.raises(
+        ValueError,
+        match="raw_data_root.*calibration frames",
+    ):
+        BurrServiceConfig.model_validate(section)
+
 
 def test_controller_paths_schedule_and_camera_settings_survive_round_trip(section):
     model = BurrServiceConfig.model_validate_json(
