@@ -79,6 +79,13 @@ class DirectTaskExecutor:
             logger.error("Device control not initialized")
             return False
 
+        if request.target is None:
+            logger.error(
+                "The direct executor does not support targetless calibration "
+                "requests; use the SensorKit executor"
+            )
+            return False
+
         should_stop = shutdown_check or (lambda: False)
         collect_id = str(uuid.uuid4())
         start_time = datetime.now(ZoneInfo("UTC"))

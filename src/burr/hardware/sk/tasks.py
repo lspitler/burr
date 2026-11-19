@@ -17,7 +17,13 @@ import astropy.units as u
 import sensorkit.api as sk
 from astropy.coordinates import AltAz as AstropyAltAz, EarthLocation, SkyCoord
 from astropy.time import Time
-from pydantic import BaseModel
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 from sensorkit.astro.common import ReferenceFrame, TLE
 from sensorkit.astro.coords import Equatorial, Horizontal
 from sensorkit.astro.target import (
@@ -61,9 +67,69 @@ class BurrContext(BaseModel):
 
 _FILE_NAME_TEMPLATE = (
     'f"{datetime.now(UTC):%Y%m%dT%H%M%S}_{Burr.mode}_{Burr.targ}'
-    '_{Task.task_id}_{Instrument.name.encode().hex()}'
+    '_{Task.id}_{Instrument.name.encode().hex()}'
     '_f{Collect.frame_number}.fits"'
 )
+
+
+class CalibrationTaskEntry(BaseModel):
+    """One camera-only DARK or BIAS sequence sent to SensorKit."""
+
+    camera: str = Field(
+        min_length=1,
+        description="Camera identity expected in the UNITID FITS header",
+    )
+    instrument: str = Field(
+        min_length=1,
+        description="SensorKit instrument name that must take the frames",
+    )
+    filter_name: str = Field(
+        alias="filter",
+        min_length=1,
+        description="Opaque filter-wheel position, normally Blank",
+    )
+    frame_type: FrameType
+    exposure_seconds: float = Field(ge=0)
+    frame_count: int = Field(ge=1)
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+    )
+
+    @field_validator("camera", "instrument", "filter_name")
+    @classmethod
+    def _nonblank_name(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError(
+                "value must not have leading or trailing whitespace: "
+                f"{value!r}"
+            )
+        return value
+
+    @field_validator("frame_type")
+    @classmethod
+    def _calibration_frame_type(
+        cls,
+        value: FrameType,
+    ) -> FrameType:
+        if value not in (FrameType.DARK, FrameType.BIAS):
+            raise ValueError(
+                "calibration frame_type must be DARK or BIAS"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _dark_needs_positive_exposure(self):
+        if (
+            self.frame_type == FrameType.DARK
+            and self.exposure_seconds <= 0
+        ):
+            raise ValueError(
+                "DARK exposure_seconds must be greater than zero"
+            )
+        return self
 
 
 def to_sk_target(burr_target) -> Target:
@@ -267,6 +333,9 @@ def build_requested_tasks(
     request: ObservationRequest,
     collect: CollectConfig | None = None,
 ) -> list[sk.TaskSubmission]:
+    if "calibration_plan" in request.metadata:
+        return [build_calibration_task(run, request, collect)]
+
     if "flat_plan" in request.metadata:
         return [build_planned_flat_task(run, request, collect)]
 
@@ -280,6 +349,12 @@ def build_sk_tasks(
     collect: CollectConfig | None = None,
 ) -> Iterator[sk.TaskSubmission]:
     """Translate ordinary requests; execution identity is assigned by SensorKit."""
+    if request.target is None:
+        raise ValueError(
+            "ordinary SensorKit requests require a target; camera-only "
+            "requests must use calibration_plan"
+        )
+
     collect = collect or CollectConfig()
     parts = _tracking_parts(
         [spec.tracking_mode for spec in request.exposure_map]
@@ -311,12 +386,92 @@ def build_sk_tasks(
             )
 
 
+def build_calibration_task(
+    run: BurrRun,
+    request: ObservationRequest,
+    collect: CollectConfig | None = None,
+) -> sk.TaskSubmission:
+    """Build one camera-only DARK/BIAS SensorKit task.
+
+    Calibration tasks deliberately use ``target=None``. SensorKit therefore
+    sends no FollowTarget or Stop commands to the mount. Each metadata entry
+    is pinned to an explicit SensorKit instrument and an opaque filter-wheel
+    position, normally Blank.
+    """
+    if request.source_name != "calibration_frames":
+        raise ValueError(
+            "calibration_plan is only supported for calibration_frames "
+            "requests"
+        )
+    if request.target is not None:
+        raise ValueError(
+            "calibration_frames requests must have target=None"
+        )
+    if request.exposure_seconds or request.exposure_map:
+        raise ValueError(
+            "calibration_frames requests describe exposures only through "
+            "metadata.calibration_plan"
+        )
+
+    raw_entries = request.metadata.get("calibration_plan")
+    if not isinstance(raw_entries, list) or not raw_entries:
+        raise ValueError(
+            "calibration_plan must contain at least one sequence"
+        )
+
+    entries = [
+        CalibrationTaskEntry.model_validate(entry)
+        for entry in raw_entries
+    ]
+    collect = collect or CollectConfig()
+    settings_by_instrument = dict(collect.instrument_settings())
+    params = []
+
+    for entry in entries:
+        inherited = settings_by_instrument.get(
+            entry.instrument,
+            collect,
+        )
+
+        # The plan owns the opaque wheel position. Other camera settings
+        # continue to inherit from shared/per-instrument collect config.
+        settings = inherited.model_copy(
+            update={"filter_name": entry.filter_name}
+        )
+        params.append(
+            _parameter_set(
+                entry.instrument,
+                settings,
+                entry.frame_type,
+                entry.exposure_seconds,
+                entry.frame_count,
+            )
+        )
+
+    end_time = run.lighting_schedule.schedule_end_utc
+    task = StandardCollectTask(
+        target=None,
+        target_id="calibration",
+        camera_params=params,
+        end_time=end_time,
+    )
+    return task.submit(
+        context=_exposure_context(request),
+        expiry_time=end_time,
+    )
+
+
 def build_planned_flat_task(
     run: BurrRun,
     request: ObservationRequest,
     collect: CollectConfig | None = None,
 ) -> sk.TaskSubmission:
     """Keep the plan's pair order, filters and independent exposures."""
+    if request.target is None:
+        raise ValueError(
+            "planned twilight flats require a pointing target"
+        )
+
     if request.source_name != "twilight_flats":
         raise ValueError(
             "flat_plan is only supported for twilight_flats requests"

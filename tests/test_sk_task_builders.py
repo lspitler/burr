@@ -103,6 +103,38 @@ def flat_request():
     )
 
 
+def calibration_request():
+    return ObservationRequest(
+        task_id="calibration-request",
+        source_name="calibration_frames",
+        target=None,
+        exposure_seconds=[],
+        exposure_map=[],
+        rates=None,
+        metadata={
+            "target_name": "calibration",
+            "calibration_plan": [
+                {
+                    "camera": "C1",
+                    "instrument": "west",
+                    "filter": "Blank",
+                    "frame_type": "dark",
+                    "exposure_seconds": 30.0,
+                    "frame_count": 2,
+                },
+                {
+                    "camera": "C0",
+                    "instrument": "east",
+                    "filter": "Blank",
+                    "frame_type": "bias",
+                    "exposure_seconds": 0.0,
+                    "frame_count": 3,
+                },
+            ],
+        },
+    )
+
+
 @pytest.fixture
 def sensor():
     topology = Topology(
@@ -146,6 +178,97 @@ def sensor():
         for placement in topology.instruments()
     }
     return bound, named
+
+
+def test_calibration_task_is_targetless_and_pinned(
+    inputs, sensor
+):
+    run, config = inputs
+    settings = CollectConfig(
+        gain=100,
+        binning=1,
+        readout_mode=2,
+        instruments={
+            "west": {"gain": 200},
+            "east": {},
+        },
+    )
+
+    (submission,) = build_requested_tasks(
+        run, config, calibration_request(), settings
+    )
+
+    assert submission.task.target is None
+    assert submission.task.target_id == "calibration"
+    assert submission.task.sidereal_frames == []
+    assert [
+        (
+            params.instrument,
+            params.filter_name,
+            params.frame_type,
+            params.integration_time_seconds,
+            params.frame_count,
+            params.gain,
+            params.binning_x,
+            params.binning_y,
+            params.readout_mode,
+        )
+        for params in submission.task.exposures
+    ] == [
+        (
+            "west",
+            "Blank",
+            FrameType.DARK,
+            30.0,
+            2,
+            200,
+            1,
+            1,
+            2,
+        ),
+        (
+            "east",
+            "Blank",
+            FrameType.BIAS,
+            0.0,
+            3,
+            100,
+            1,
+            1,
+            2,
+        ),
+    ]
+
+    bound, named = sensor
+    packed = pack(
+        translate(submission.task, instruments=named),
+        bound,
+    )
+
+    # This is the key behaviour supplied by SensorKit 146396a.
+    assert packed.prepare == ()
+    assert packed.cleanup == ()
+    assert all(
+        setting.target.device != "mount"
+        for epoch in packed.epochs
+        for setting in epoch.settings
+    )
+
+    captures = [
+        (
+            unit.target.device,
+            unit.command.frame_type,
+            unit.command.integration_time,
+        )
+        for epoch in packed.epochs
+        for unit in epoch.units
+    ]
+    assert captures.count(
+        ("cam-west", FrameType.DARK, 30.0)
+    ) == 2
+    assert captures.count(
+        ("cam-east", FrameType.BIAS, 0.0)
+    ) == 3
 
 
 @pytest.mark.parametrize(
@@ -341,7 +464,7 @@ def test_filename_uses_execution_identity_and_distinguishes_instruments(
             submission.context,
             TaskInfo(
                 task=submission.task,
-                task_id=minted,
+                id=minted,
                 controller_id="ctrl",
             ),
             InstrumentInfo(name=params.instrument),
@@ -412,4 +535,59 @@ def test_invalid_requests_fail_instead_of_using_a_fallback(inputs):
     with pytest.raises(ValueError, match="require tracking rates"):
         request = observation([RATE])
         request.rates = None
+        build_requested_tasks(run, config, request)
+
+
+def test_calibration_request_requires_no_target(inputs):
+    run, config = inputs
+    request = calibration_request()
+    request.target = RADecTarget(
+        right_ascension_deg=10,
+        declination_deg=20,
+    )
+
+    with pytest.raises(ValueError, match="must have target=None"):
+        build_requested_tasks(run, config, request)
+
+
+def test_calibration_request_rejects_empty_plan(inputs):
+    run, config = inputs
+    request = calibration_request()
+    request.metadata["calibration_plan"] = []
+
+    with pytest.raises(ValueError, match="at least one sequence"):
+        build_requested_tasks(run, config, request)
+
+
+def test_calibration_request_rejects_light_frames(inputs):
+    run, config = inputs
+    request = calibration_request()
+    request.metadata["calibration_plan"][0]["frame_type"] = "light"
+
+    with pytest.raises(ValueError, match="DARK or BIAS"):
+        build_requested_tasks(run, config, request)
+
+
+def test_calibration_request_rejects_tracking_frames(inputs):
+    run, config = inputs
+    request = calibration_request()
+    request.exposure_map = [
+        ExposureSpec(tracking_mode=TrackingMode.OFF)
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match="only through metadata.calibration_plan",
+    ):
+        build_requested_tasks(run, config, request)
+
+
+def test_dark_requires_positive_exposure(inputs):
+    run, config = inputs
+    request = calibration_request()
+    request.metadata["calibration_plan"][0][
+        "exposure_seconds"
+    ] = 0.0
+
+    with pytest.raises(ValueError, match="greater than zero"):
         build_requested_tasks(run, config, request)

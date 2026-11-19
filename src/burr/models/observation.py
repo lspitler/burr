@@ -80,8 +80,14 @@ class ObservationRequest(BaseModel):
     """
 
     task_id: str
-    source_name: str = Field(description="Task source: 'photometry', 'coverage', 'calsats', 'flats', 'lunar'")
-    target: TargetUnion = Field(discriminator="type")
+    source_name: str = Field(description="Task source: 'photometry', 'coverage', 'calsats', 'flats', 'lunar', 'calibration_frames'")
+    target: TargetUnion | None = Field(
+        discriminator="type",
+        description=(
+            "Pointing target, or None for SensorKit camera-only calibration "
+            "collections that must not command the mount"
+        ),
+    )
     exposure_seconds: list[float] = Field(description="Exposure durations for the task set")
     exposure_map: list[ExposureSpec] = Field(description="Tracking mode per frame within each exposure")
     rates: RateSpec | None = None
