@@ -81,9 +81,8 @@ from burr.run.utils import get_or_create_run
 from burr.scheduler.factory import build_scheduler
 from burr.scheduler.scheduler import Scheduler
 from burr.scheduler.slot import TaskSlot
-from burr.task_source.protocol import TaskSource
 from burr.task_source.calibration.manager import CalibrationFrameManager
-
+from burr.task_source.protocol import TaskSource
 
 OFFER_REFRESH_SECONDS = 30 * 60
 OFFER_RETRY_SECONDS = 60
@@ -348,6 +347,14 @@ async def _validate_instruments(ctx: _ProgramContext) -> None:
     if flats.collect and plan is not None:
         names.update(pair.instrument for pair in plan.pairs)
 
+    calibration = ctx.config.schedule.calibration_frames
+    calibration_plan = getattr(calibration, "plan", None)
+    if calibration.collect and calibration_plan is not None:
+        names.update(
+            sequence.instrument
+            for sequence in calibration_plan.sequences
+        )
+
     if not names:
         return
 
@@ -603,6 +610,7 @@ def build_task_sources(
     if schedule.calibration_frames.collect:
         sources["calibration_frames"] = CalibrationFrameManager(
             run=run,
+            sk_data_root=config.sk.data_root,
         )
 
     if schedule.twilight_flats.collect:

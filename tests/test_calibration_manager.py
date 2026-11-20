@@ -1,5 +1,6 @@
 """Task-source tests for DARK and BIAS calibration collection."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -73,7 +74,30 @@ def make_manager(
         ),
         log_command=Mock(),
     )
-    return CalibrationFrameManager(run), run
+    manager = CalibrationFrameManager(
+        run,
+        sk_data_root=Path("/unused-test-data"),
+    )
+
+    def accept_requested_frames(request, request_plan):
+        del request
+        return {
+            sequence.identity(): [
+                Path(
+                    f"/simulated/{sequence.camera}/"
+                    f"{sequence.frame_type}-{index}.fits"
+                )
+                for index in range(
+                    request_plan.target(sequence)
+                )
+            ]
+            for sequence in request_plan.sequences
+        }
+
+    manager._readback_request = Mock(
+        side_effect=accept_requested_frames
+    )
+    return manager, run
 
 
 def request_plan(request):
@@ -299,7 +323,33 @@ def test_manager_requires_a_plan():
         ValueError,
         match="requires calibration_frames.plan",
     ):
-        CalibrationFrameManager(run)
+        CalibrationFrameManager(
+            run,
+            sk_data_root=Path("/unused-test-data"),
+        )
+
+
+def test_manager_requires_a_sensor_data_root():
+    plan = CalibrationPlanConfig.model_validate(plan_data())
+    config = CalibrationFramesConfig(
+        collect=True,
+        windows=["day"],
+        plan=plan,
+    )
+    run = SimpleNamespace(
+        config=SimpleNamespace(
+            schedule=SimpleNamespace(
+                calibration_frames=config,
+            )
+        ),
+        log_command=Mock(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="requires a SensorKit data root",
+    ):
+        CalibrationFrameManager(run, sk_data_root=None)
 
 
 def test_offer_windows_use_configured_conditions_and_withdraw_when_complete():

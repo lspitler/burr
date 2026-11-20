@@ -7,6 +7,7 @@ import contextlib
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -66,7 +67,11 @@ def setup(monkeypatch):
             twilight_flats=SimpleNamespace(
                 collect=True,
                 plan=SimpleNamespace(pairs=[SimpleNamespace(instrument="east")]),
-            )
+            ),
+            calibration_frames=SimpleNamespace(
+                collect=False,
+                plan=None,
+            ),
         )
     )
     ctx = program._ProgramContext(
@@ -327,6 +332,60 @@ def test_validates_plan_instruments_without_global_selection(
         asyncio.run(program._validate_instruments(ctx))
 
 
+def test_validates_calibration_plan_instruments(setup, monkeypatch):
+    ctx, _, _, _ = setup
+    ctx.config.schedule.twilight_flats = SimpleNamespace(
+        collect=False,
+        plan=None,
+    )
+    ctx.config.schedule.calibration_frames = SimpleNamespace(
+        collect=True,
+        plan=SimpleNamespace(
+            sequences=[
+                SimpleNamespace(instrument="calibration-camera")
+            ]
+        ),
+    )
+    controller = SimpleNamespace(
+        kv_get_model=AsyncMock(
+            return_value=sk.EntityInfo(
+                entity_type="controller",
+                details=sk.ControllerDetails(
+                    supported_tasks=["standard_collect"],
+                    controlled_devices=[],
+                    instruments=(
+                        sk.InstrumentInfo(name="other-camera"),
+                    ),
+                ),
+            )
+        )
+    )
+    api = SimpleNamespace(
+        kv_get_model=AsyncMock(
+            return_value=SimpleNamespace(
+                enable_state=SimpleNamespace(
+                    enabled=True,
+                    controller="Huntsman",
+                )
+            )
+        ),
+        sensorkit=lambda: SimpleNamespace(
+            controller=lambda name: controller
+        ),
+    )
+    monkeypatch.setattr(
+        program.sk,
+        "program",
+        lambda: api,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="calibration-camera",
+    ):
+        asyncio.run(program._validate_instruments(ctx))
+
+
 def test_cancelled_generation_accounts_for_its_request(setup, monkeypatch):
     ctx, pending, source, slot = setup
     ctx.pending.clear()
@@ -476,6 +535,7 @@ def test_build_task_sources_constructs_enabled_calibration(
     )
 
     disabled = SimpleNamespace(collect=False)
+    data_root = Path("/raw/calibration")
     config = SimpleNamespace(
         schedule=SimpleNamespace(
             calibration_frames=SimpleNamespace(collect=True),
@@ -485,7 +545,7 @@ def test_build_task_sources_constructs_enabled_calibration(
             coverage=disabled,
             calsats=disabled,
         ),
-        sk=SimpleNamespace(data_root=None),
+        sk=SimpleNamespace(data_root=data_root),
     )
     run = object()
 
@@ -494,4 +554,7 @@ def test_build_task_sources_constructs_enabled_calibration(
     assert sources == {
         "calibration_frames": calibration_source,
     }
-    constructor.assert_called_once_with(run=run)
+    constructor.assert_called_once_with(
+        run=run,
+        sk_data_root=data_root,
+    )

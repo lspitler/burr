@@ -1,14 +1,13 @@
 """Task source for targetless DARK and BIAS calibration collection."""
-import math
-import time
-from pathlib import Path
-
-from astropy.io import fits
 
 from __future__ import annotations
 
+import math
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
+from astropy.io import fits
 from loguru import logger
 
 from burr.models.observation import ObservationRequest
@@ -26,24 +25,26 @@ _EXPOSURE_REL_TOLERANCE = 1e-6
 _EXPOSURE_ABS_TOLERANCE_SECONDS = 1e-6
 _FITS_READ_ERRORS = (OSError, ValueError, fits.VerifyError)
 
+
 def _header_text(header: fits.Header, key: str) -> str:
-    """Return a stripped fits header value or an empty string"""
+    """Return a stripped FITS header value, or an empty string."""
     value = header.get(key)
     return "" if value is None else str(value).strip()
 
+
 def _image_header_cards(path: Path) -> fits.Header | None:
-    """Read the first image-HDU header without decompressing its pixels"""
+    """Read the first image-HDU header without decompressing its pixels."""
     try:
         with fits.open(path) as hdul:
             for hdu in hdul:
                 if (
                     isinstance(hdu, fits.CompImageHDU)
-                    or hdu.header.get("NAXIS", 0) >=2
+                    or hdu.header.get("NAXIS", 0) >= 2
                 ):
                     return hdu.header.copy()
     except _FITS_READ_ERRORS as error:
         logger.debug(
-            f"skipping unreadable calibration FITS {path}: {error}"
+            f"Skipping unreadable calibration FITS {path}: {error}"
         )
     return None
 
@@ -62,8 +63,9 @@ class CalibrationFrameManager:
     Sequences with the same filter, frame type and exposure are grouped into
     one request so sensorkit can collect that calibration condition from several cameras together.
 
-    Calibration progress advances only after SensorKit FITS files have been associated with the dispatched and validated against the
-    configured camer, filter, frame type and exposure.
+    Calibration progress advances only after SensorKit FITS files have been
+    associated with the dispatched task and validated against the configured
+    camera, filter, frame type and exposure.
     """
 
     def __init__(self, run: BurrRun, sk_data_root: Path | None):
@@ -73,17 +75,22 @@ class CalibrationFrameManager:
 
         if self.plan is None:
             raise ValueError(
-                "CalibrationFrameManager requires calibration_frames_plan"
+                "CalibrationFrameManager requires calibration_frames.plan"
             )
         if sk_data_root is None:
-            raise ValueError("CalibrationFrameManager requires a SensorKit data root")
+            raise ValueError(
+                "CalibrationFrameManager requires a SensorKit data root"
+            )
 
         self.sk_data_root = Path(sk_data_root)
         self.frame_settle_seconds = self.config.frame_settle_seconds
         self.max_request_retries = self.config.max_request_retries
         self._dispatched: dict[str, str] = {}
 
-        self.configured: dict[ SequenceIdentity, CalibrationSequencePlan] = {
+        self._configured: dict[
+            SequenceIdentity,
+            CalibrationSequencePlan,
+        ] = {
             sequence.identity(): sequence
             for sequence in self.plan.sequences
         }
@@ -237,14 +244,14 @@ class CalibrationFrameManager:
         )
 
     def on_task_dispatched(
-            self,
-            request: ObservationRequest,
-            sk_task_id: str,
+        self,
+        request: ObservationRequest,
+        sk_task_id: str,
     ) -> None:
-        """Asspcoate a Burr request with its SensorKit execution"""
-        self._dispatched(request.task_id) = str(sk_task_id)
+        """Associate a Burr request with its SensorKit execution."""
+        self._dispatched[request.task_id] = str(sk_task_id)
         logger.debug(
-            f"Calibration request {request.task_id} dispatched as"
+            f"Calibration request {request.task_id} dispatched as "
             f"SensorKit task {sk_task_id}"
         )
 
@@ -253,11 +260,11 @@ class CalibrationFrameManager:
         request: ObservationRequest,
         duration_seconds: float,
     ) -> None:
-        """Accept only frames validated against the completed task"""
+        """Accept only frames validated against the completed task."""
         request_plan = self._request_plan(request)
         updates = []
 
-        # validate the complete request before reading or changing state
+        # Validate the complete request before reading or changing state.
         for requested in request_plan.sequences:
             configured = self._configured_sequence(requested)
             state = self._state(configured)
@@ -280,39 +287,39 @@ class CalibrationFrameManager:
             request_plan,
         )
 
-        for(requested, configured, state, requested_frames
-            ) in updates:
-                paths = accepted.get(configured.identity(), [])
-                accepted_frames = len(paths)
+        for _, configured, state, requested_frames in updates:
+            paths = accepted.get(configured.identity(), [])
+            accepted_frames = len(paths)
 
-                if accepted_frames > requested_frames:
-                    raise RuntimeError(
-                        f"readback returned {accepted_frames} for"
-                        f"{configured.label()}, but the request expected only"
-                        f"{requested_frames}"
-                    )
+            if accepted_frames > requested_frames:
+                raise RuntimeError(
+                    f"readback returned {accepted_frames} frame(s) for "
+                    f"{configured.label()}, but the request expected only "
+                    f"{requested_frames}"
+                )
 
-                if accepted_frames:
-                    state.completed_frames += accepted_frames
-                    state.consecutive_failures = 0
+            if accepted_frames:
+                state.completed_frames += accepted_frames
+                state.consecutive_failures = 0
 
-                    target = self.plan.targer(configured)
-                    complete = state.completed_frames >= target
-                    command = (
-                        "calibration_sequence_completed"
-                        if complete
-                        else "calibration_sequence_progress"
-                    )
+                target = self.plan.target(configured)
+                complete = state.completed_frames >= target
+                command = (
+                    "calibration_sequence_completed"
+                    if complete
+                    else "calibration_sequence_progress"
+                )
 
-                    logger.info(
-                        f"Calibration frames accepted"
-                        f"{configured.label()}"
-                        f"{state.completed_frames}/{target}"
-                    )
-                    self.run.log_command(
-                        command,
-                        (f"{state.completed_frames}/{target}"
-                        "validated franes"),
+                logger.info(
+                    f"Calibration frames accepted: {configured.label()} "
+                    f"{state.completed_frames}/{target}"
+                )
+                self.run.log_command(
+                    command,
+                    (
+                        f"{state.completed_frames}/{target} "
+                        "validated frames"
+                    ),
                     {
                         **self._sequence_metadata(configured),
                         "request_id": request.task_id,
@@ -321,35 +328,40 @@ class CalibrationFrameManager:
                         "completed_frames": state.completed_frames,
                         "target_frames": target,
                         "duration_seconds": duration_seconds,
-                        "source_paths": [str(path) for path in paths],
-                    }
+                        "source_paths": [
+                            str(path)
+                            for path in paths
+                        ],
+                    },
                 )
-                missing = requested_frames - accepted_frames
-                if missing:
-                    self._record_sequence_failure(
-                        configured,
-                        request,
-                        (
-                            f"readback accepted {accepted_frames}/"
-                            f"{requested_frames} expected frames(s)"
-                            f"{missing} missing or invalid"
-                        )
-                    )
+
+            missing = requested_frames - accepted_frames
+            if missing:
+                self._record_sequence_failure(
+                    configured,
+                    request,
+                    (
+                        f"readback accepted {accepted_frames}/"
+                        f"{requested_frames} expected frame(s); "
+                        f"{missing} missing or invalid"
+                    ),
+                )
 
         if self.all_targets_met:
             completed, required = self.progress_totals()
             logger.success(
-                f"Calibration frame collection complete:"
+                f"Calibration frame collection complete: "
                 f"{completed}/{required}"
             )
-
 
     def on_request_failed(
         self,
         request: ObservationRequest,
         error: str,
     ) -> None:
-        """Record a failed request and exhaust repeatedly failing sequences."""
+        """Record a failed request and clear its dispatch identity."""
+        self._dispatched.pop(request.task_id, None)
+
         try:
             request_plan = self._request_plan(request)
         except (TypeError, ValueError) as validation_error:
@@ -361,7 +373,9 @@ class CalibrationFrameManager:
 
         for requested in request_plan.sequences:
             try:
-                configured = self._configured_sequence(requested)
+                configured = self._configured_sequence(
+                    requested
+                )
             except ValueError as validation_error:
                 logger.error(
                     f"Could not match failed calibration request "
@@ -369,38 +383,55 @@ class CalibrationFrameManager:
                 )
                 continue
 
-            state = self._state(configured)
-            state.consecutive_failures += 1
-            exhausted = self._is_exhausted(configured)
-
-            logger.warning(
-                f"Calibration sequence failed: {configured.label()} "
-                f"(failure {state.consecutive_failures}, "
-                f"retry limit {self.max_request_retries}): {error}"
-            )
-            self.run.log_command(
-                "calibration_sequence_failed",
+            self._record_sequence_failure(
+                configured,
+                request,
                 error,
-                {
-                    **self._sequence_metadata(configured),
-                    "request_id": request.task_id,
-                    "consecutive_failures": state.consecutive_failures,
-                    "max_request_retries": self.max_request_retries,
-                    "exhausted": exhausted,
-                },
-                error=error,
             )
 
-            if exhausted:
-                logger.error(
-                    f"Calibration sequence exhausted after repeated "
-                    f"failures: {configured.label()}"
-                )
+    def _record_sequence_failure(
+        self,
+        configured: CalibrationSequencePlan,
+        request: ObservationRequest,
+        error: str,
+    ) -> None:
+        """Record one failed collection attempt for a sequence."""
+        state = self._state(configured)
+        state.consecutive_failures += 1
+        exhausted = self._is_exhausted(configured)
+
+        logger.warning(
+            f"Calibration sequence failed: {configured.label()} "
+            f"(failure {state.consecutive_failures}, "
+            f"retry limit {self.max_request_retries}): {error}"
+        )
+        self.run.log_command(
+            "calibration_sequence_failed",
+            error,
+            {
+                **self._sequence_metadata(configured),
+                "request_id": request.task_id,
+                "consecutive_failures": (
+                    state.consecutive_failures
+                ),
+                "max_request_retries": (
+                    self.max_request_retries
+                ),
+                "exhausted": exhausted,
+            },
+            error=error,
+        )
+
+        if exhausted:
+            logger.error(
+                "Calibration sequence exhausted after repeated "
+                f"failures: {configured.label()}"
+            )
 
     def _readback_request(
-            self,
-            request: ObservationRequest,
-            request_plan: CalibrationPlanConfig,
+        self,
+        request: ObservationRequest,
+        request_plan: CalibrationPlanConfig,
     ) -> dict[SequenceIdentity, list[Path]]:
         """Read and validate FITS files produced by one SensorKit task."""
         sk_task_id = self._dispatched.pop(
@@ -409,11 +440,12 @@ class CalibrationFrameManager:
         )
         if sk_task_id is None:
             raise ValueError(
-                f"calibration request {request.task_id} has no recorded SensorKit task ID"
+                f"calibration request {request.task_id} has no recorded "
+                "SensorKit task ID"
             )
         if not self.sk_data_root.exists():
             raise FileNotFoundError(
-                f"SensorKit data root does not exist:"
+                "SensorKit data root does not exist: "
                 f"{self.sk_data_root}"
             )
 
@@ -426,23 +458,24 @@ class CalibrationFrameManager:
             configured = self._configured_sequence(requested)
             expected[configured.identity()] = (
                 configured,
-                request_plan.target(requested)
+                request_plan.target(requested),
             )
 
         accepted, rejected = self._wait_for_task_frames(
             sk_task_id,
-            expected
+            expected,
         )
 
         for path, reason in rejected:
             logger.warning(
-                f"Calibration frame {path} from task {sk_task_id} was rejected {reason}"
+                f"Calibration frame {path} from task {sk_task_id} "
+                f"was rejected: {reason}"
             )
             self.run.log_command(
                 "calibration_frame_rejected",
                 reason,
                 {
-                    "request_id": request.task_idm
+                    "request_id": request.task_id,
                     "sk_task_id": sk_task_id,
                     "source_path": str(path),
                     "reason": reason,
@@ -451,12 +484,21 @@ class CalibrationFrameManager:
         return accepted
 
     def _wait_for_task_frames(
-            self, sk_task_id: str, expected: dict[SequenceIdentity, tuple[CalibrationSequencePlan, int]],
-    ) -> tuple[dict[SequenceIdentity, list[Path]],
-        list[tuple[Path, str]]
+        self,
+        sk_task_id: str,
+        expected: dict[
+            SequenceIdentity,
+            tuple[CalibrationSequencePlan, int],
+        ],
+    ) -> tuple[
+        dict[SequenceIdentity, list[Path]],
+        list[tuple[Path, str]],
     ]:
-        """Wait for all expected files carryng SensorKit task ID."""
-        required = sum(frame_count for _, frame_count in expected.values())
+        """Wait for all expected files carrying the SensorKit task ID."""
+        required = sum(
+            frame_count
+            for _, frame_count in expected.values()
+        )
         deadline = time.monotonic() + self.frame_settle_seconds
 
         while True:
@@ -470,22 +512,175 @@ class CalibrationFrameManager:
             )
 
             if (
-                found >=required
+                found >= required
                 or time.monotonic() >= deadline
             ):
                 return accepted, rejected
 
-            time.sleep(0.5)
+            time.sleep(
+                min(
+                    0.5,
+                    max(deadline - time.monotonic(), 0.0),
+                )
+            )
 
     def _task_frames(
-            self,
-            sk_task_id: str,
-            expected: dict[SequenceIdentity, tuple[CalibrationSequencePlan, int]]
-    ) -> tuple [
+        self,
+        sk_task_id: str,
+        expected: dict[
+            SequenceIdentity,
+            tuple[CalibrationSequencePlan, int],
+        ],
+    ) -> tuple[
         dict[SequenceIdentity, list[Path]],
-        list[tuple[Path, str]]
+        list[tuple[Path, str]],
     ]:
-        
+        """Find and classify files belonging to one SensorKit task."""
+        accepted: dict[SequenceIdentity, list[Path]] = {
+            identity: []
+            for identity in expected
+        }
+        rejected: list[tuple[Path, str]] = []
+
+        for path in sorted(
+            self.sk_data_root.rglob("*.fits")
+        ):
+            header = _image_header_cards(path)
+            if header is None:
+                continue
+
+            if _header_text(
+                header,
+                "SKTASKID",
+            ) != sk_task_id:
+                continue
+
+            try:
+                identity = self._match_frame_header(
+                    header,
+                    expected,
+                )
+            except ValueError as error:
+                rejected.append((path, str(error)))
+                continue
+
+            _, expected_count = expected[identity]
+            if len(accepted[identity]) >= expected_count:
+                rejected.append(
+                    (
+                        path,
+                        (
+                            "extra frame after the requested "
+                            f"{expected_count} frame(s)"
+                        ),
+                    )
+                )
+                continue
+
+            accepted[identity].append(path)
+
+        return accepted, rejected
+
+    def _match_frame_header(
+        self,
+        header: fits.Header,
+        expected: dict[
+            SequenceIdentity,
+            tuple[CalibrationSequencePlan, int],
+        ],
+    ) -> SequenceIdentity:
+        """Match required FITS metadata to exactly one requested sequence."""
+        required = (
+            "UNITID",
+            "FILTER",
+            "IMAGETYP",
+            "EXPTIME",
+        )
+        missing = [
+            key
+            for key in required
+            if header.get(key) is None
+        ]
+        if missing:
+            raise ValueError(
+                "missing required FITS card(s): "
+                + ", ".join(missing)
+            )
+
+        camera = _header_text(header, "UNITID")
+        filter_name = _header_text(header, "FILTER")
+        image_type = _header_text(
+            header,
+            "IMAGETYP",
+        ).lower()
+
+        try:
+            exposure = float(header["EXPTIME"])
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"invalid EXPTIME={header.get('EXPTIME')!r}"
+            ) from error
+
+        if not math.isfinite(exposure):
+            raise ValueError(
+                f"invalid EXPTIME={exposure!r}"
+            )
+
+        candidates = [
+            (identity, sequence)
+            for identity, (sequence, _) in expected.items()
+            if sequence.camera == camera
+        ]
+        if not candidates:
+            raise ValueError(
+                f"unexpected UNITID={camera!r}"
+            )
+
+        candidates = [
+            item
+            for item in candidates
+            if item[1].filter == filter_name
+        ]
+        if not candidates:
+            raise ValueError(
+                f"unexpected FILTER={filter_name!r} "
+                f"for UNITID={camera!r}"
+            )
+
+        candidates = [
+            item
+            for item in candidates
+            if item[1].frame_type == image_type
+        ]
+        if not candidates:
+            raise ValueError(
+                f"unexpected IMAGETYP={image_type.upper()!r}; "
+                "expected DARK or BIAS as configured"
+            )
+
+        candidates = [
+            item
+            for item in candidates
+            if math.isclose(
+                item[1].exposure_seconds,
+                exposure,
+                rel_tol=_EXPOSURE_REL_TOLERANCE,
+                abs_tol=_EXPOSURE_ABS_TOLERANCE_SECONDS,
+            )
+        ]
+        if not candidates:
+            raise ValueError(
+                f"unexpected EXPTIME={exposure:g} for "
+                f"UNITID={camera!r}, FILTER={filter_name!r}, "
+                f"IMAGETYP={image_type.upper()!r}"
+            )
+
+        if len(candidates) != 1:
+            raise ValueError(
+                "FITS metadata matches more than one calibration sequence"
+            )
+
+        return candidates[0][0]
 
     def _request_plan(
         self,
