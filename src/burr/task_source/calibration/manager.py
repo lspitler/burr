@@ -17,6 +17,15 @@ from burr.task_source.calibration.plan import (
     CalibrationPlanConfig,
     CalibrationSequencePlan,
 )
+from burr.task_source.calibration.products import (
+    CalibrationProductError,
+    CalibrationProductKey,
+    CalibrationProductRecord,
+    inspect_source,
+    log_restore_report,
+    publish,
+    scan_products,
+)
 
 SequenceIdentity = tuple[str, str, str, float]
 SequenceGroup = tuple[str, str, float]
@@ -101,6 +110,13 @@ class CalibrationFrameManager:
             identity: CalibrationSequenceState()
             for identity in self._configured
         }
+        self._next_product_sequence: dict[
+            CalibrationProductKey,
+            int,
+        ] = {}
+        self._accepted_sources: set[str] = set()
+        self._accepted_hashes: set[str] = set()
+        self._restore_products()
         self._completed_logged = False
         self._exhausted_logged = False
 
@@ -255,6 +271,29 @@ class CalibrationFrameManager:
             f"SensorKit task {sk_task_id}"
         )
 
+    def _restore_products(self) -> None:
+        restored = scan_products(
+            Path(self.run.output_directory)
+        )
+        log_restore_report(restored)
+
+        self._next_product_sequence = dict(
+            restored.next_sequence
+        )
+        self._accepted_sources = set(
+            restored.source_paths
+        )
+        self._accepted_hashes = set(
+            restored.source_hashes
+        )
+
+        for sequence in self.plan.sequences:
+            self._state(sequence).completed_frames = len(
+                restored.records_for(sequence)
+            )
+
+        self.restore_report = restored
+
     def on_request_completed(
         self,
         request: ObservationRequest,
@@ -289,7 +328,11 @@ class CalibrationFrameManager:
 
         for _, configured, state, requested_frames in updates:
             paths = accepted.get(configured.identity(), [])
-            accepted_frames = len(paths)
+            products = self._publish_frames(
+                configured,
+                paths,
+            )
+            accepted_frames = len(products)
 
             if accepted_frames > requested_frames:
                 raise RuntimeError(
@@ -329,8 +372,16 @@ class CalibrationFrameManager:
                         "target_frames": target,
                         "duration_seconds": duration_seconds,
                         "source_paths": [
-                            str(path)
-                            for path in paths
+                            record.source_path
+                            for record in products
+                        ],
+                        "output_paths": [
+                            str(
+                                record.path.relative_to(
+                                    self.run.output_directory
+                                )
+                            )
+                            for record in products
                         ],
                     },
                 )
@@ -595,6 +646,10 @@ class CalibrationFrameManager:
             "FILTER",
             "IMAGETYP",
             "EXPTIME",
+            "DATE-OBS",
+            "READOUTM",
+            "XBINNING",
+            "YBINNING",
         )
         missing = [
             key
@@ -681,6 +736,103 @@ class CalibrationFrameManager:
             )
 
         return candidates[0][0]
+
+    def _publish_frames(
+        self,
+        configured: CalibrationSequencePlan,
+        paths: list[Path],
+    ) -> list[CalibrationProductRecord]:
+        records: list[CalibrationProductRecord] = []
+
+        for path in paths:
+            try:
+                source = inspect_source(path)
+                if not source.key.matches(configured):
+                    raise CalibrationProductError(
+                        "source indentity does not match"
+                        f"{configured.label()}"
+                    )
+                if (
+                    str(source.path)
+                    in self._accepted_sources
+                    or source.source_hash
+                    in self._accepted_hashes
+                ):
+                    raise CalibrationProductError(
+                        "source frame was already published"
+                    )
+                sequence = self._next_product_sequence.get(
+                    source.key,
+                    1,
+                )
+                record = publish(
+                    source,
+                    Path(self.run.output_directory),
+                    sequence,
+                )
+            except (
+                CalibrationProductError,
+                FileExistsError,
+                OSError,
+            ) as error:
+                logger.error(
+                    f"Could not publish calibration frame "
+                    f"{path}: {error}"
+                )
+                self.run.log_command(
+                    "calibration_frame_rejected",
+                    str(error),
+                    {
+                        **self._sequence_metadata(
+                            configured
+                        ),
+                        "source_path": str(path),
+                        "reason": str(error),
+                    },
+                )
+                continue
+
+            self._next_product_sequence[
+                source.key
+            ] = sequence + 1
+            self._accepted_sources.add(
+                str(source.path)
+            )
+            self._accepted_hashes.add(
+                source.source_hash
+            )
+            records.append(record)
+            self.run.log_command(
+                "calibration_frame_saved",
+                (
+                    f"Published calibration frame "
+                    f"{sequence}"
+                ),
+                {
+                    **self._sequence_metadata(
+                        configured
+                    ),
+                    "readout_mode": (
+                        source.key.readout_mode
+                    ),
+                    "binning_x": source.key.bin_x,
+                    "binning_y": source.key.bin_y,
+                    "sequence": sequence,
+                    "task_uuid": source.task_uuid,
+                    "source_path": str(source.path),
+                    "source_sha256": (
+                        source.source_hash
+                    ),
+                    "output_path": str(
+                        record.path.relative_to(
+                            self.run.output_directory
+                        )
+                    ),
+                },
+            )
+
+        return records
+
 
     def _request_plan(
         self,

@@ -20,6 +20,10 @@ def _write_frame(
     filter_name="Blank",
     image_type="DARK",
     exposure=30.0,
+    date_obs="2026-11-20T01:02:03.123456",
+    readout_mode=0,
+    bin_x=1,
+    bin_y=1,
     omit=(),
 ):
     header = fits.Header()
@@ -29,6 +33,10 @@ def _write_frame(
         "FILTER": filter_name,
         "IMAGETYP": image_type,
         "EXPTIME": exposure,
+        "DATE-OBS": date_obs,
+        "READOUTM": readout_mode,
+        "XBINNING": bin_x,
+        "YBINNING": bin_y,
     }
     for key, value in cards.items():
         if key not in omit:
@@ -73,6 +81,7 @@ def _manager(
         plan=plan,
     )
     run = SimpleNamespace(
+        output_directory=tmp_path / "processed",
         config=SimpleNamespace(
             schedule=SimpleNamespace(
                 calibration_frames=config,
@@ -116,13 +125,21 @@ def test_valid_calibration_frames_are_accepted(
             raw / f"frame-{index}.fits",
             image_type=frame_type.upper(),
             exposure=exposure,
+            date_obs=f"2026-11-20T01:02:03.12345{index}",
+            readout_mode=0,
+            bin_x=1,
+            bin_y=1,
         )
 
     manager.on_request_completed(request, 2.5)
 
     assert manager.progress_totals() == (2, 2)
     assert manager.all_targets_met is True
-    assert _commands(run) == ["calibration_sequence_completed"]
+    assert _commands(run) == [
+        "calibration_frame_saved",
+        "calibration_frame_saved",
+        "calibration_sequence_completed",
+    ]
     metadata = run.log_command.call_args.args[2]
     assert metadata["accepted_frames"] == 2
     assert len(metadata["source_paths"]) == 2
@@ -135,6 +152,7 @@ def test_valid_calibration_frames_are_accepted(
         ("filter_name", "Lum"),
         ("image_type", "LIGHT"),
         ("exposure", 31.0),
+        ("readout_mode", "unsafe/name"),
     ],
 )
 def test_incorrect_metadata_is_rejected(
@@ -162,7 +180,16 @@ def test_incorrect_metadata_is_rejected(
 
 @pytest.mark.parametrize(
     "missing_card",
-    ["UNITID", "FILTER", "IMAGETYP", "EXPTIME"],
+    [
+        "UNITID",
+        "FILTER",
+        "IMAGETYP",
+        "EXPTIME",
+        "DATE-OBS",
+        "READOUTM",
+        "XBINNING",
+        "YBINNING",
+    ],
 )
 def test_missing_required_metadata_is_rejected(
     tmp_path,
@@ -225,7 +252,10 @@ def test_extra_frame_is_rejected_without_overcounting(tmp_path):
     manager, run, raw = _manager(tmp_path, frames=2)
     request = _request(manager)
     for index in range(3):
-        _write_frame(raw / f"frame-{index}.fits")
+        _write_frame(
+            raw / f"frame-{index}.fits",
+            date_obs=f"2026-11-20T01:02:03.12345{index}",
+        )
 
     manager.on_request_completed(request, 1.0)
 
@@ -250,3 +280,18 @@ def test_completion_requires_recorded_sensor_task(tmp_path):
         manager.on_request_completed(request, 1.0)
 
     assert manager.progress_totals() == (0, 1)
+
+
+def test_published_products_restore_progress(tmp_path):
+    manager, run, raw = _manager(tmp_path, frames=1)
+    request = _request(manager)
+    _write_frame(raw / "frame.fits")
+
+    manager.on_request_completed(request, 1.0)
+
+    restored = CalibrationFrameManager(
+        run,
+        sk_data_root=raw,
+    )
+    assert restored.progress_totals() == (1, 1)
+    assert restored.generate_request("unused") is None

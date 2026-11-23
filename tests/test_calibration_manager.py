@@ -1,6 +1,7 @@
 """Task-source tests for DARK and BIAS calibration collection."""
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -66,7 +67,9 @@ def make_manager(
         max_request_retries=max_request_retries,
         plan=plan,
     )
+    output_directory = TemporaryDirectory()
     run = SimpleNamespace(
+        output_directory=Path(output_directory.name),
         config=SimpleNamespace(
             schedule=SimpleNamespace(
                 calibration_frames=config,
@@ -78,6 +81,7 @@ def make_manager(
         run,
         sk_data_root=Path("/unused-test-data"),
     )
+    manager._test_output_directory = output_directory
 
     def accept_requested_frames(request, request_plan):
         del request
@@ -96,6 +100,22 @@ def make_manager(
 
     manager._readback_request = Mock(
         side_effect=accept_requested_frames
+    )
+
+    def publish_requested_frames(configured, paths):
+        return [
+            SimpleNamespace(
+                source_path=str(path),
+                path=(
+                    run.output_directory
+                    / f"{configured.camera}-{configured.frame_type}-{index}.fits"
+                ),
+            )
+            for index, path in enumerate(paths)
+        ]
+
+    manager._publish_frames = Mock(
+        side_effect=publish_requested_frames
     )
     return manager, run
 
